@@ -12,12 +12,12 @@ exit /b
 :run
 if not exist output\register_functions.cpp (echo Run 3_recompile.bat first. & exit /b 1)
 set "RT=tools\PS2Recomp\ps2xRuntime"
-rem Remove generated files from any earlier run, then copy the current ones
-del /q "%RT%\src\runner\*.cpp" 2>nul
-del /q "%RT%\include\ps2_recompiled_functions.h" "%RT%\include\ps2_recompiled_stubs.h" 2>nul
-echo Copying generated sources...
-copy /y output\*.cpp "%RT%\src\runner\" >nul
-copy /y output\*.h   "%RT%\include\" >nul
+rem Sync generated files: copy only changed ones (keeps incremental builds fast) and remove stale .cpp
+echo Syncing generated sources (a minute or two)...
+powershell -NoProfile -ExecutionPolicy Bypass -File sync_generated.ps1 -Src output -Dst "%RT%\src\runner" -Filter *.cpp -Prune
+if errorlevel 1 (echo Sync FAILED. & exit /b 1)
+powershell -NoProfile -ExecutionPolicy Bypass -File sync_generated.ps1 -Src output -Dst "%RT%\include" -Filter ps2_recompiled_*.h
+if errorlevel 1 (echo Sync FAILED. & exit /b 1)
 rem Apply this project's fixes to PS2Recomp (skips any already applied)
 for %%P in (patches\*.patch) do (
   git apply --reverse --check --directory=tools/PS2Recomp "%%P" >nul 2>&1 || git apply --directory=tools/PS2Recomp "%%P" || (echo Failed to apply %%P & exit /b 1)

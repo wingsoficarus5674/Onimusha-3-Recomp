@@ -74,6 +74,16 @@ Those labels point at data, not code. The heuristic fallback config gives about 
   One is at 0x05000000, outside the 32 MB of RDRAM, and made the loader stop with
   "ELF segment 198 exceeds RDRAM bounds". Empty segments outside guest memory are now skipped with a warning.
 
+## Manual bindings
+
+Functions Ghidra couldn't name but that were identified by hand, bound to runtime handlers in
+`config\onimusha3.toml` under `stubs`:
+
+| Address | Function | Why |
+|---|---|---|
+| 0x0010E780 | `sceSifInitCmd` | Registers SIF system commands 0x80000008/9/A/C, sends the init command to the IOP, then waits for software register 0. Nothing on the runtime's IOP side sets that register, so the game span forever on a pink screen. |
+| 0x0010DFD8 | `sceSifGetSreg` | Reads the software-register table at 0x0051FC80. It's the function the wait loop above polls. |
+
 ## After the first boot
 
 These steps follow PS2Recomp's recommended loop:

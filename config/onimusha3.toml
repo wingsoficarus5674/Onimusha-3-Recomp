@@ -17,6 +17,9 @@ patch_syscalls = false
 patch_cop0 = true
 patch_cache = true
 stubs = [
+  # Manual bindings (identified by hand, see README "Manual bindings")
+  "sceSifInitCmd@0x0010E780",
+  "sceSifGetSreg@0x0010DFD8",
   "SetGsCrt@0x0010B920",
   "AddIntcHandler@0x0010BA00",
   "AddIntcHandler@0x0010BA10",
