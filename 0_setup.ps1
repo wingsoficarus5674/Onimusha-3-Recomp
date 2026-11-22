@@ -10,8 +10,8 @@ $files = @(
   @{ url='https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.2_build/ghidra_12.2_PUBLIC_20261016.zip';
      sha='2c2cd776db3c1f6a097ba418922378ac3649cadd5e844a6f5f088ae628a7be67' },
   @{ url='https://github.com/chaoticgd/ghidra-emotionengine-reloaded/releases/download/v2.1.39/ghidra_12.2_PUBLIC_20261029_ghidra-emotionengine-reloaded.zip'; sha=$null },
-  @{ url='https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13%2B9/OpenJDK21U-jdk_x64_windows_hotspot_21.0.13_9.zip';
-     sha='a4dbaa05fca4bd89d84584e58c459bd732efebb1722af80ab13c6516832004f9' },
+  @{ url='https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5.1%2B2/OpenJDK25U-jdk_x64_windows_hotspot_25.0.5.1_2.zip';
+     sha='849d380ab0a64d9098e7d3a2de28beb73841c3b255c8284f019ccd8748c5eb5b' },
   @{ url='https://codeload.github.com/ran-j/PS2Recomp/zip/refs/heads/main'; name='PS2Recomp-main.zip'; sha=$null }
 )
 foreach ($f in $files) {
@@ -23,7 +23,7 @@ foreach ($f in $files) {
 if (-not (Test-Path tools\ghidra_12.2_PUBLIC)) { Expand-Archive downloads\ghidra_12.2_PUBLIC_20261016.zip tools }
 if (-not (Test-Path tools\ghidra_12.2_PUBLIC\Ghidra\Extensions\ghidra-emotionengine-reloaded)) {
   Expand-Archive downloads\ghidra_12.2_PUBLIC_20261029_ghidra-emotionengine-reloaded.zip tools\ghidra_12.2_PUBLIC\Ghidra\Extensions }
-if (-not (Test-Path 'tools\jdk-21.0.13+9')) { Expand-Archive downloads\OpenJDK21U-jdk_x64_windows_hotspot_21.0.13_9.zip tools }
+if (-not (Test-Path 'tools\jdk-25.0.5.1+2')) { Expand-Archive downloads\OpenJDK25U-jdk_x64_windows_hotspot_25.0.5.1_2.zip tools }
 if (-not (Test-Path tools\PS2Recomp)) { Expand-Archive downloads\PS2Recomp-main.zip tools; Rename-Item tools\PS2Recomp-main PS2Recomp }
 
 # Copy disc contents (mount the ISO with Windows' built-in support)

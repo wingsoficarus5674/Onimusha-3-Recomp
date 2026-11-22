@@ -14,7 +14,7 @@ SHA-256 of the ELF: `22955889d3db316fb039d0c805debc8188c384211fb4ddbfedc3e1238e7
 | `game\` | Files pulled from the ISO: `SYSTEM.CNF`, `SLUS_206.94`, `IMAGE\IMAGE.AFS` (2.2 GB game data), `IMAGE\0FLIST.DIR` and `IMAGE\MODULES\*.IRX` (the IOP modules). The runtime treats this folder as `cdrom0:`. |
 | `tools\PS2Recomp\` | PS2Recomp source code, main branch (commit e563698, 2026-10-22) |
 | `tools\ghidra_12.2_PUBLIC\` | Ghidra 12.2 with the **ghidra-emotionengine-reloaded v2.1.39** (R5900/PS2) extension already in `Ghidra\Extensions` |
-| `tools\jdk-21.0.13+9\` | Eclipse Temurin JDK 21. Ghidra needs this, and the scripts use it automatically. |
+| `tools\jdk-25.0.5.1+2\` | Eclipse Temurin JDK 25. Ghidra 12.2 requires Java 25 or newer, and the scripts use it automatically. |
 | `downloads\` | The original zip files. SHA-256 for Ghidra and the JDK checked against the publishers' values. |
 | `0_setup.ps1` | Downloads everything in `tools\` and copies the disc into `game\` from your own ISO |
 | `config\onimusha3_analyzer_fallback.toml` | A config made with `ps2_analyzer` as a test |
@@ -47,9 +47,17 @@ That's the workflow PS2Recomp's own instructions recommend for retail games.
 
 ## Workflow
 
+`config\onimusha3.toml` and `config\onimusha3_functions.csv` are already included (generated with step 1),
+so you can skip straight to step 2. Re-run step 1 only if you change the Ghidra analysis.
+
+Test results with the included config: 7,775 functions; `ps2_recomp` reports 7,617 unhandled-instruction errors,
+most of them in five synthetic `entry_*` labels between 0x4EF000 and 0x51E200, where the bytes are ASCII text.
+Those labels point at data, not code. The heuristic fallback config gives about 16,500 errors.
+
 1. `1_ghidra_analyze.bat` runs Ghidra's auto-analysis without opening the Ghidra window and then runs `ExportPS2Functions.java`.
    It writes `config\onimusha3.toml` and `config\onimusha3_functions.csv`, and keeps the project
-   in `ghidra_project\`. Expect it to take 15–60 minutes.
+   in `ghidra_project\`. Expect it to take 15–60 minutes. Everything it prints is saved to
+   `config\1_ghidra_analyze_output.txt`.
 2. `2_build_tools.bat` builds `ps2_recomp.exe` and `ps2_analyzer.exe`.
 3. `3_recompile.bat` turns the MIPS code into C++ in `output\`. The log goes to `recompile.log`. If there's no Ghidra config,
    it falls back to the analyzer config.
