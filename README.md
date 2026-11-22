@@ -108,6 +108,9 @@ keeping it constant means a new stub binding recompiles a few files instead of a
 - `0012-mc-open-create-without-access.patch`: the game creates its save files with `sceMcOpen(..., 0x200)`
   (CREAT, no access bits) and then writes to them. The runtime opened those read-only, so saving failed
   and the game asked to create a save file forever.
+- `0013-gif-path3-image-continuation.patch`: `sceGsExecLoadImage` sends the IMAGE GIFtag in one GIF DMA and the
+  pixels in the next. The runtime parsed each DMA as a new packet and dropped the pixels, so fonts and CLUTs
+  uploaded at boot were missing. PATH3 now carries an unfinished IMAGE over to the next transfer.
 
 ## Manual bindings
 
@@ -193,7 +196,7 @@ in this runtime a guest thread that never makes a syscall would never yield.
 7. ~~Sound upload loop (SNDDRV returning -3)~~ (patch 0007)
 8. ~~Main loop running but nothing drawn: ADX threads starved~~ (patch 0008)
 9. ~~Scrambled blocks on screen: libgraph struct/packet mismatch, split PATH3 image uploads, half-height field
-   buffers~~ (libgraph bindings removed, PATH3 IMAGE continuation in the GIF path, patch 0010)
+   buffers~~ (libgraph bindings removed, patches 0010 and 0013)
 10. ~~Memory card dialog ignoring input~~ (patch 0011, libpad2)
 11. ~~"Create a save file?" loop~~ (patch 0012)
 12. Boots through "Checking Memory Card", creates/loads the save, and shows the CAPCOM logo.
