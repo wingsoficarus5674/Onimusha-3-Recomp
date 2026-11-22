@@ -76,13 +76,35 @@ Those labels point at data, not code. The heuristic fallback config gives about 
 
 ## Manual bindings
 
-Functions Ghidra couldn't name but that were identified by hand, bound to runtime handlers in
-`config\onimusha3.toml` under `stubs`:
+Functions Ghidra couldn't name that were identified by hand (from their call patterns and the SIF
+command IDs they send), bound to runtime handlers in `config\onimusha3.toml` under `stubs`.
+This is Sony's libkernel SIF CMD/RPC library. The game's own copies talk to an IOP that isn't there,
+so `sceCdInit` (0x0011D758) waited forever for the CD server (RPC 0x80000592) on a pink screen.
 
-| Address | Function | Why |
+| Address | Function | Evidence |
 |---|---|---|
-| 0x0010E780 | `sceSifInitCmd` | Registers SIF system commands 0x80000008/9/A/C, sends the init command to the IOP, then waits for software register 0. Nothing on the runtime's IOP side sets that register, so the game span forever on a pink screen. |
-| 0x0010DFD8 | `sceSifGetSreg` | Reads the software-register table at 0x0051FC80. It's the function the wait loop above polls. |
+| 0x0010DFD8 | `sceSifGetSreg` | reads the software-register table at 0x0051FC80 |
+| 0x0010E020 | `sceSifInitCmd` | sets up the SIF DMA chain, sends cmds 0x80000000-0x80000002 |
+| 0x0010E2A0 | `sceSifExitCmd` | removes the SIF DMA handler |
+| 0x0010E308 | `sceSifAddCmdHandler` | (cid, func, data) table write |
+| 0x0010E380 | `sceSifRemoveCmdHandler` | clears a table entry |
+| 0x0010E508 | `sceSifSendCmd` | wraps the DMA send at 0x0010E3D0 |
+| 0x0010E6D0 | `sceSifWriteBackDCache` | (addr, size) |
+| 0x0010E780 | `sceSifInitRpc` | called by sceCdInit(0); registers handlers 0x80000008/9/A/C; waits for sreg 0 |
+| 0x0010E920 | `sceSifExitRpc` | calls sceSifExitCmd |
+| 0x0010EC60 | `sceSifGetOtherData` | sends 0x8000000C, waits on a semaphore |
+| 0x0010EF18 | `sceSifBindRpc` | sends 0x80000009 |
+| 0x0010F0E8 | `sceSifCallRpc` | sends 0x8000000A |
+| 0x0010F2E0 | `sceSifCheckStatRpc` | (client) status check |
+| 0x0010F320 | `sceSifSetRpcQueue` | (queue, thread) |
+| 0x0010F3B8 | `sceSifRegisterRpc` | server registration |
+| 0x0010F488 | `sceSifRemoveRpc` | (server, queue) |
+| 0x0010F520 | `sceSifRemoveRpcQueue` | (queue) |
+| 0x0010F5B0 | `sceSifGetNextRequest` | (queue) |
+| 0x0010F608 | `sceSifExecRequest` | runs a server function, replies with 0x80000008 |
+| 0x0010F7D0 | `sceSifRpcLoop` | GetNextRequest/ExecRequest/SleepThread loop |
+
+Also identified, not bound: `sceCdInit` 0x0011D758, `printf` 0x0010DF48.
 
 ## After the first boot
 
