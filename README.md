@@ -77,6 +77,37 @@ keeping it constant means a new stub binding recompiles a few files instead of a
 - `0001-skip-empty-out-of-range-elf-segments.patch`: SLUS_206.94 has about 200 empty overlay placeholder segments.
   One is at 0x05000000, outside the 32 MB of RDRAM, and made the loader stop with
   "ELF segment 198 exceeds RDRAM bounds". Empty segments outside guest memory are now skipped with a warning.
+- `0002-iop-sif-initialised-at-boot.patch`: on real hardware the IOP BIOS has initialised SIF before game modules
+  load, so `sceSifCheckInit()` returns 1. The emulator started at 0, and SNDDRV printed "yet sif hasn't been init".
+- `0003-iop-module-start-argc-argv.patch`: IRX entry points are `start(argc, argv)` with `argv[0]` = module path.
+  The emulator passed `(argumentSize, rawBuffer)`. Capcom's SNDDRV needs `argc == 11` (path + 10 settings) and
+  otherwise exits without becoming resident, so the game waited forever for its RPC server 0x77777777.
+- `0004-iop-bind-rpc-to-ee.patch`: IOP-side `sceSifBindRpc` was a stub that never set `client->server`.
+  SNDDRV binds to the game's EE server 0x77777779 (it never calls it) and loops until the bind succeeds.
+- `0005-ee-thread-priority-zero.patch`: the EE kernel accepts priorities 0-127. The runtime rejected 0 in
+  `CreateThread`/`ChangeThreadPriority`, but its main thread runs at 0 and CRI's ADXM setup creates its threads
+  with the main thread's current priority, so CRI's file/stream threads were never created.
+- `0006-keep-interrupt-stacks-off-main-stack.patch`: the game's main thread stack is 0x01FF8000-0x02000000, and the
+  runtime carved interrupt-handler stacks downward from 0x02000000 too. The vblank/timer handlers overwrote the
+  main thread's saved `$ra`, so the main thread "returned" to address 0 right after reading the AFS header.
+- `0007-iop-libsd-voice-trans-shim.patch`: SPU2 sound-memory DMA isn't emulated, so libsd's `sceSdVoiceTrans`
+  failed and SNDDRV answered every sample upload with -3; the game retried forever. The IOP now reports
+  `sceSdVoiceTrans`/`sceSdVoiceTransStatus` as completed (no audio is played yet).
+- `0008-ee-change-thread-priority-returns-old.patch`: `ChangeThreadPriority` returned 0 instead of the previous
+  priority. CRI's ADX lock saves that value and restores it on unlock, so every unlock raised the caller to
+  priority 0 and the busy-waiting main thread starved the ADX streaming threads.
+- `0009-debugger-hidden-by-default.patch`: the runtime debugger window starts hidden so the game is visible.
+  F1 toggles it; set `PS2X_DEBUG_UI=1` to show it at launch.
+- `0010-gs-present-half-height-field-buffers.patch`: the game runs interlaced with SMODE2.FFMD=1 and 512x224
+  buffers, while DISPLAY.DH is 448 output lines. The presenter read 448 buffer lines, so the bottom half of the
+  window showed texture memory. It now reads (DH+1)/2 lines and line-doubles them.
+- `0011-libpad2-hle-and-onimusha3-overrides.patch`: the game reads the controller with libpad2 (DBCMAN/SIO2),
+  which the runtime doesn't emulate, so no buttons ever arrived. Adds a small libpad2 HLE fed from the keyboard
+  or gamepad, bound to the game's libpad2 functions by a `SLUS_206.94` game override. The same override skips the
+  IPU still-image decoder (FUN_0028CE60), which would otherwise stop the runtime on `sceDmaRecvN`.
+- `0012-mc-open-create-without-access.patch`: the game creates its save files with `sceMcOpen(..., 0x200)`
+  (CREAT, no access bits) and then writes to them. The runtime opened those read-only, so saving failed
+  and the game asked to create a save file forever.
 
 ## Manual bindings
 
@@ -133,7 +164,58 @@ the EE side instead, reading from the `game\` folder. Identified by RPC service 
 | 0x001141D8 0x00114330 0x00114358 0x001143A8 | `sceSifResetIop` `sceSifIsAliveIop` `sceSifSyncIop` `sceSifRebootIop` | SIF regs/DMA; RebootIop is called with IOPRP280.IMG |
 
 Also identified, not bound: `printf` 0x0010DF48; main 0x00159020 → game init 0x0027A1C0.
+A further 168 SDK functions (libgraph, libdma, libvu0, libmc, libmpeg/ipu, kernel helpers and libc) come from
+`ps2_analyzer`'s signature matching in `onimusha3_analyzer_fallback.toml`, merged where the runtime has a handler.
+`sceCdCallback@0x0011C8E0` from that list was left out (it conflicts with the evidence for 0x0011CD98).
 
+Some analyzer bindings were removed on purpose so the game's own (recompiled) code runs instead:
+- `malloc_extend_top@0x00122320`: the runtime's handler is a no-op, so `malloc` never got memory and
+  `_strtod_r`/`_lshift` looped forever.
+- libgraph `sceGsResetGraph`, `sceGsSetDefDispEnv`, `sceGszbufaddr`, `sceGsSetDefDrawEnv`, `sceGsSetDefClear`,
+  `sceGsPutDrawEnv`, `sceGsSetDefDBuff`, `sceGsSetDefDrawEnv2`, `sceGsSetDefDBuffDc`, `sceGsSetDefLoadImage`,
+  `sceGsExecLoadImage`: the runtime's versions fill simplified private structs, but this game reads those
+  structs itself and DMAs them to the GS (texture uploads became garbage and the display pointed at texture
+  memory). They are plain packet builders plus GS register writes, so native code is exact. `sceGsSyncV`,
+  `sceGsSyncPath`, `sceGsSyncVCallback` and `sceGsResetPath` stay bound (they wait on hardware).
+
+The idle thread at 0x0018B990 (eight `nop`s and a branch back) is deliberately left without a recompiled function:
+in this runtime a guest thread that never makes a syscall would never yield.
+
+
+## Boot progress so far
+
+1. ~~Pink screen: `sceSifInitRpc` waiting for SIF sreg 0~~ (SIF bindings)
+2. ~~Pink screen: `sceCdInit` waiting for the CD RPC server~~ (libcdvd/fileio/loadfile bindings)
+3. ~~Pink screen: `sceGsSyncV` polling INTC_STAT~~ (libgraph bindings from the analyzer)
+4. ~~Sound init waiting for SNDDRV's RPC servers~~ (patches 0002-0004)
+5. ~~Black screen: CRI ADXF never reading `IMAGE.AFS`~~ (patch 0005)
+6. ~~Main thread exiting after reading the AFS header~~ (patch 0006)
+7. ~~Sound upload loop (SNDDRV returning -3)~~ (patch 0007)
+8. ~~Main loop running but nothing drawn: ADX threads starved~~ (patch 0008)
+9. ~~Scrambled blocks on screen: libgraph struct/packet mismatch, split PATH3 image uploads, half-height field
+   buffers~~ (libgraph bindings removed, PATH3 IMAGE continuation in the GIF path, patch 0010)
+10. ~~Memory card dialog ignoring input~~ (patch 0011, libpad2)
+11. ~~"Create a save file?" loop~~ (patch 0012)
+12. Boots through "Checking Memory Card", creates/loads the save, and shows the CAPCOM logo.
+13. **Current blocker: code overlays.** Most game code (title screen, menus, areas) lives in 517 compressed
+    Capcom "LINK" modules (`*.ldt` in `IMAGE.AFS`) that the game decompresses into RAM at 0x00D00000+ at
+    run time (the 198 empty ELF segments are their placeholders). Static recompilation only covers the main
+    ELF, so right after the logo the game calls 0x00D367E0 (overlay code) and its logic thread stops.
+    Next step: extract and decompress the `.ldt` modules, recompile each at its load address, and have the
+    runtime pick the recompiled module that is currently resident when it dispatches into that range.
+
+Known gaps: no audio output yet (SPU2 not emulated), IPU-decoded still images and FMVs are not emulated.
+
+## Controls (keyboard)
+
+| PS2 | Key |
+|---|---|
+| Cross / Circle / Square / Triangle | X or Space / C or Esc / Z / V |
+| Start / Select | Enter / Tab |
+| D-pad | Arrow keys or WASD |
+| L1 / R1 / L2 / R2 | Q / E / Left Shift / Right Shift |
+
+A connected gamepad is used instead of the keyboard when present. Saves go to `game\mc0\BASLUS-20694`.
 
 ## After the first boot
 

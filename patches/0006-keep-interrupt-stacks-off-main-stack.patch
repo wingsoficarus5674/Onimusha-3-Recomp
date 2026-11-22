@@ -1,0 +1,25 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 9614016..7d4b858 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -531,6 +531,20 @@ namespace ps2_syscalls
+         }
+ 
+         scheduler.setupCurrentThread(initialStack, stackSize, getRegU32(ctx, 28));
++        if (initialStack != 0u && sp > initialStack && sp >= PS2_RAM_SIZE - 0x10u)
++        {
++            // Interrupt handlers and async callbacks get stacks carved downward from the
++            // end of RDRAM. When the main thread's stack is also at the end of RDRAM (e.g.
++            // Onimusha 3: 0x01FF8000-0x02000000), interrupt frames overwrite the main
++            // thread's saved registers. Reserve the main stack first so carve-outs start
++            // below it, plus slack: the main thread can run past its nominal size (Onimusha 3
++            // goes below 0x01FF8000), which is harmless on hardware where nothing lives there.
++            constexpr uint32_t kMainStackSlack = 0x40000u;
++            const uint32_t reserveSize = (initialStack > kMainStackSlack)
++                                             ? (PS2_RAM_SIZE - initialStack + kMainStackSlack)
++                                             : (PS2_RAM_SIZE - initialStack);
++            (void)runtime->reserveAsyncCallbackStack(reserveSize, 16u);
++        }
+         setReturnU32(ctx, sp);
+     }
+ 

@@ -5,7 +5,7 @@ setlocal
 cd /d "%~dp0"
 if "%~1"=="__run" goto run
 if not exist build mkdir build
-powershell -NoProfile -Command "cmd /c 'call %~nx0 __run 2>&1' | Tee-Object -FilePath 'build\4_build_runtime_output.txt'"
+powershell -NoProfile -Command "cmd /c 'call %~nx0 __run %~1 2>&1' | Tee-Object -FilePath 'build\4_build_runtime_output.txt'"
 pause
 exit /b
 
@@ -26,7 +26,11 @@ rem Apply this project's fixes to PS2Recomp (skips any already applied)
 for %%P in (patches\*.patch) do (
   git apply --reverse --check --directory=tools/PS2Recomp "%%P" >nul 2>&1 || git apply --directory=tools/PS2Recomp "%%P" || (echo Failed to apply %%P & exit /b 1)
 )
-cmake -S tools\PS2Recomp -B build\runtime -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF
+rem Per-function trace logging (ps2_log.txt) makes the game very slow. Off by default;
+rem run "4_build_runtime.bat trace" to turn it on for debugging. Switching either way rebuilds everything.
+set "TRACE=OFF"
+if /i "%~2"=="trace" set "TRACE=ON"
+cmake -S tools\PS2Recomp -B build\runtime -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF -DPS2X_ENABLE_AGRESSIVE_LOGS=%TRACE%
 if errorlevel 1 (echo CMake configure FAILED. & exit /b 1)
 cmake --build build\runtime --config Release --parallel --target ps2EntryRunner
 if errorlevel 1 (echo. & echo BUILD FAILED - search build\4_build_runtime_output.txt for "error". & exit /b 1)

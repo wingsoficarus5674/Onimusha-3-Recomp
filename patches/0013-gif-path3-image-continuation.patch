@@ -1,0 +1,64 @@
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 37b6a4d..df8d81c 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1958,6 +1958,59 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t
+         flushMaskedPath3Packets(false);
+     }
+ 
++    // PATH3 keeps its GIF state between DMA transfers: libgraph's sceGsExecLoadImage
++    // sends the IMAGE GIFtag in one transfer and the pixel data in the next. Carry an
++    // unfinished IMAGE over by giving the following data a synthetic IMAGE GIFtag.
++    std::vector<uint8_t> path3Joined;
++    if (pathId == GifPathId::Path3)
++    {
++        static uint32_t s_path3ImageQwLeft = 0u;
++        const uint32_t totalQw = sizeBytes / 16u;
++        uint32_t qw = 0u;
++        if (s_path3ImageQwLeft != 0u)
++        {
++            const uint32_t take = std::min(s_path3ImageQwLeft, totalQw);
++            const uint64_t imageTag = static_cast<uint64_t>(take) | (2ull << 58);
++            path3Joined.resize(16u);
++            std::memcpy(path3Joined.data(), &imageTag, sizeof(imageTag));
++            std::memset(path3Joined.data() + 8u, 0, 8u);
++            path3Joined.insert(path3Joined.end(), data, data + static_cast<size_t>(sizeBytes));
++            s_path3ImageQwLeft -= take;
++            qw = take;
++        }
++        while (qw < totalQw)
++        {
++            uint64_t tagLo = 0;
++            std::memcpy(&tagLo, data + static_cast<size_t>(qw) * 16u, sizeof(tagLo));
++            ++qw;
++            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
++            const uint32_t flg = static_cast<uint32_t>((tagLo >> 58) & 0x3u);
++            uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
++            if (nreg == 0u)
++                nreg = 16u;
++            uint32_t payloadQw = 0u;
++            if (flg == 0u)
++                payloadQw = nloop * nreg;
++            else if (flg == 1u)
++                payloadQw = (nloop * nreg + 1u) / 2u;
++            else
++                payloadQw = nloop;
++            const uint32_t availQw = totalQw - qw;
++            if (payloadQw > availQw)
++            {
++                if (flg >= 2u)
++                    s_path3ImageQwLeft = payloadQw - availQw;
++                break;
++            }
++            qw += payloadQw;
++        }
++        if (!path3Joined.empty())
++        {
++            data = path3Joined.data();
++            sizeBytes = static_cast<uint32_t>(path3Joined.size());
++        }
++    }
++
+     if (m_gifArbiter)
+         m_gifArbiter->submit(pathId, data, sizeBytes, path2DirectHl);
+     else if (m_gifPacketCallback)

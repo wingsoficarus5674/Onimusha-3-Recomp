@@ -1,0 +1,17 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+index 564d873..be0145e 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+@@ -432,7 +432,11 @@ namespace ps2_stubs
+ 
+         FILE *openMcHostFile(const std::filesystem::path &hostPath, uint32_t flags)
+         {
+-            const uint32_t access = flags & PS2_FIO_O_RDWR;
++            uint32_t access = flags & PS2_FIO_O_RDWR;
++            // MCMAN makes a file opened with SCE_CREAT writable even when no access
++            // bits are given; games create their save with mode 0x200 and write to it.
++            if ((flags & PS2_FIO_O_CREAT) != 0u && access == 0u)
++                access = PS2_FIO_O_RDWR;
+             const bool read = (access == PS2_FIO_O_RDONLY) || (access == PS2_FIO_O_RDWR);
+             const bool write = (access == PS2_FIO_O_WRONLY) || (access == PS2_FIO_O_RDWR);
+             const bool append = (flags & PS2_FIO_O_APPEND) != 0u;

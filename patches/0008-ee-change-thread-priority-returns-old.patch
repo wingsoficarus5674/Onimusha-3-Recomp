@@ -1,0 +1,16 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+index 5110ee2..67eae3d 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+@@ -112,7 +112,10 @@ namespace ps2_syscalls
+             const int priority = static_cast<int>(getRegU32(ctx, 5));
+             int oldPriority = 0;
+             const int result = ee.changePriority(id, priority, interruptSafe, oldPriority);
+-            setReturnS32(ctx, result);
++            // The EE kernel returns the thread's previous priority on success.
++            // Middleware (e.g. CRI ADX lock/unlock) saves it and restores it later;
++            // returning 0 would leave those threads at the highest priority.
++            setReturnS32(ctx, (result == KE_OK) ? oldPriority : result);
+             ee.transferIfRequested(interruptSafe);
+         }
+ 

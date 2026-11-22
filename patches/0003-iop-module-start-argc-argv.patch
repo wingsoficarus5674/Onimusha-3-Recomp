@@ -1,0 +1,58 @@
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index e5f63a9..c95ac2c 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -614,17 +614,47 @@ namespace ps2x::iop::detail
+             module.entry = loaded.entry;
+             module.gp = loaded.gp;
+ 
+-            uint32_t args = 0u;
++            // IRX entry points are start(int argc, char *argv[]) with argv[0] = module path and
++            // argv[1..] = the NUL-separated strings from sceSifLoadModule's argument buffer
++            // (as loadcore/modload does on real hardware). Drivers such as Capcom's SNDDRV
++            // check argc and parse argv[1..], and exit without becoming resident otherwise.
++            std::vector<std::string> argStrings;
++            argStrings.push_back(module.path);
+             if (arguments && argumentSize)
+             {
+-                args = allocate(argumentSize + 1u, 16u);
+-                if (args)
++                const char *bytes = static_cast<const char *>(arguments);
++                uint32_t pos = 0u;
++                while (pos < argumentSize)
+                 {
+-                    writeRam(args, arguments, argumentSize);
+-                    write8(args + argumentSize, 0u);
++                    uint32_t end = pos;
++                    while (end < argumentSize && bytes[end] != '\0')
++                        ++end;
++                    argStrings.emplace_back(bytes + pos, end - pos);
++                    pos = end + 1u;
+                 }
+             }
+-            const uint32_t startResult = callFunction(module.entry, argumentSize, args, 0u, 0u, module.gp);
++            const uint32_t argc = static_cast<uint32_t>(argStrings.size());
++            uint32_t stringBytes = 0u;
++            for (const std::string &arg : argStrings)
++                stringBytes += static_cast<uint32_t>(arg.size()) + 1u;
++            const uint32_t argvBytes = (argc + 1u) * 4u;
++            const uint32_t args = allocate(argvBytes + stringBytes, 16u);
++            uint32_t argv = 0u;
++            if (args)
++            {
++                argv = args;
++                uint32_t cursor = args + argvBytes;
++                for (uint32_t i = 0; i < argc; ++i)
++                {
++                    const std::string &arg = argStrings[i];
++                    write32(argv + i * 4u, cursor);
++                    writeRam(cursor, arg.data(), static_cast<uint32_t>(arg.size()));
++                    write8(cursor + static_cast<uint32_t>(arg.size()), 0u);
++                    cursor += static_cast<uint32_t>(arg.size()) + 1u;
++                }
++                write32(argv + argc * 4u, 0u);
++            }
++            const uint32_t startResult = callFunction(module.entry, args ? argc : 0u, argv, 0u, 0u, module.gp);
+             if (args)
+                 freeAllocation(args);
+             module.resident = startResult == 0u || startResult == 2u;

@@ -1,0 +1,22 @@
+diff --git a/ps2xRuntime/src/lib/ps2_debug_panel.cpp b/ps2xRuntime/src/lib/ps2_debug_panel.cpp
+index c9aa2c6..6659a23 100644
+--- a/ps2xRuntime/src/lib/ps2_debug_panel.cpp
++++ b/ps2xRuntime/src/lib/ps2_debug_panel.cpp
+@@ -1,4 +1,6 @@
+ #include "ps2_debug_panel.h"
++
++#include <cstdlib>
+ #include "ps2_runtime.h"
+ #include "ps2_runtime_macros.h"
+ #include "ps2_log.h"
+@@ -2183,6 +2185,10 @@ void PS2DebugPanel::initialize()
+     {
+         rlImGuiSetup(true);
+         m_initialized = true;
++        // Start with the game view unobstructed; F1 toggles the debugger.
++        // Set PS2X_DEBUG_UI=1 to show it at launch.
++        const char *showDebugUi = std::getenv("PS2X_DEBUG_UI");
++        setVisible(showDebugUi != nullptr && showDebugUi[0] != '\0' && showDebugUi[0] != '0');
+     }
+ #endif
+ }

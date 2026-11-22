@@ -1,0 +1,48 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f0ad507..08b477c 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1871,6 +1871,28 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+     uint32_t width1 = 0u, height1 = 0u, width2 = 0u, height2 = 0u;
+     decodeDisplaySize(request.display1, width1, height1);
+     decodeDisplaySize(request.display2, width2, height2);
++    // Interlaced with FFMD=1: each field scans every line of a half-height buffer,
++    // while DISPLAY.DH counts output lines. Read half the lines, then line-double.
++    const bool halfHeightFields = smode2.interlaced && smode2.frameMode;
++    if (halfHeightFields)
++    {
++        height1 = std::max<uint32_t>(1u, (height1 + 1u) / 2u);
++        height2 = std::max<uint32_t>(1u, (height2 + 1u) / 2u);
++    }
++    auto lineDouble = [&](PresentationFrame &frame)
++    {
++        if (!halfHeightFields || frame.pixels.empty() || frame.height * 2u > kHostFrameHeight)
++            return;
++        for (uint32_t y = frame.height; y-- > 0u;)
++        {
++            const uint8_t *src = frame.pixels.data() + static_cast<size_t>(y) * kHostFrameWidth * 4u;
++            uint8_t *dst0 = frame.pixels.data() + static_cast<size_t>(y * 2u) * kHostFrameWidth * 4u;
++            uint8_t *dst1 = frame.pixels.data() + static_cast<size_t>(y * 2u + 1u) * kHostFrameWidth * 4u;
++            std::memmove(dst1, src, frame.width * 4u);
++            std::memmove(dst0, src, frame.width * 4u);
++        }
++        frame.height *= 2u;
++    };
+     const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1);
+     const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
+     if (!valid1 && !valid2)
+@@ -1960,6 +1982,7 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+                 applyFieldPresentation(result.pixels, result.width, result.height, oddField);
+             result.displayFbp = displayFrame1.fbp;
+             result.sourceFbp = selected1.fbp;
++            lineDouble(result);
+             return result;
+         }
+     }
+@@ -1976,5 +1999,6 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+     normalizePresentationAlpha(result.pixels, result.width, result.height);
+     result.displayFbp = displayFrame.fbp;
+     result.sourceFbp = selected.fbp;
++    lineDouble(result);
+     return result;
+ }

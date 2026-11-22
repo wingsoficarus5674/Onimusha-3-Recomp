@@ -1,0 +1,30 @@
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index c95ac2c..ac10e5a 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -245,6 +245,25 @@ namespace ps2x::iop::detail
+                 cpu.gpr[2] = value;
+             };
+ 
++            if (iequals(call.library, "libsd"))
++            {
++                // SPU2 sound memory DMA is not emulated, so the real LIBSD.IRX's
++                // sceSdVoiceTrans fails and drivers that upload samples (Capcom's SNDDRV
++                // command 0x11) report an error the game retries forever. Report the
++                // transfer as done; audio data is not played. Other libsd calls still run
++                // the real module.
++                if (call.ordinal == 17u) // sceSdVoiceTrans(channel, mode, iopAddr, spuAddr, size)
++                {
++                    setV0(memory.read32(cpu.gpr[29] + 16u));
++                    return ImportDisposition::Handled;
++                }
++                if (call.ordinal == 19u) // sceSdVoiceTransStatus(channel, flag)
++                {
++                    setV0(1u);
++                    return ImportDisposition::Handled;
++                }
++            }
++
+             if (iequals(call.library, "sysmem") && sysmem.dispatchImport(call.ordinal, cpu))
+                 return ImportDisposition::Handled;
+ 

@@ -1,0 +1,16 @@
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index cf4fdc6..bcb98fe 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -22,7 +22,10 @@ namespace ps2x::iop::detail
+     {
+         m_servers.clear();
+         m_nextDmaId = 1u;
+-        m_sifInitialized = false;
++        // On real hardware the IOP BIOS (SIFMAN) initialises SIF before any game module
++        // loads, so sceSifCheckInit() already returns 1. Drivers such as Capcom's SNDDRV
++        // skip registering their RPC server when it returns 0.
++        m_sifInitialized = true;
+     }
+ 
+     bool IopRpcBridge::dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu)

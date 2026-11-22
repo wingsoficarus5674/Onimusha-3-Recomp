@@ -1,0 +1,173 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+index b50a4cf..1c0ab86 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+@@ -861,3 +861,115 @@ namespace ps2_stubs
+         g_padOverrideState = PadInputState{};
+     }
+ }
++
++// ---------------------------------------------------------------------------
++// libpad2 (scePad2*) HLE.
++//
++// Some games (e.g. Onimusha 3) read the DualShock 2 through libpad2, which
++// talks to DBCMAN.IRX and the DS2 drivers over SIO2. SIO2 is not emulated, so
++// those games never see a controller. These handlers stand in for the libpad2
++// entry points and feed the host keyboard/gamepad state in libpad2's format.
++// They are bound per game by address from game_overrides.cpp.
++// ---------------------------------------------------------------------------
++namespace ps2_stubs
++{
++    namespace libpad2_hle
++    {
++        constexpr int32_t kPad2StateNoLink = 0;
++        constexpr int32_t kPad2StateStable = 1;
++        constexpr int32_t kPad2ReadSize = 18; // 2 button bytes, 4 sticks, 12 pressures
++        constexpr int32_t kPad2ProfileSize = 4;
++
++        // Only port 0 has a controller attached.
++        bool socketHasController(uint32_t socket)
++        {
++            return socket == 0u;
++        }
++
++        // sceDbcInit(): report success; DBCMAN is not used by the HLE path.
++        void dbcInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++        {
++            (void)rdram;
++            (void)runtime;
++            setReturnS32(ctx, 1);
++        }
++
++        // scePad2CreateSocket(scePad2SocketParam *param, void *addr): socket number = port.
++        void createSocket(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++        {
++            (void)runtime;
++            const uint32_t paramAddr = getRegU32(ctx, 4);
++            uint32_t port = 0u;
++            if (const uint8_t *param = getConstMemPtr(rdram, paramAddr))
++            {
++                std::memcpy(&port, param + 4, sizeof(port));
++            }
++            setReturnS32(ctx, static_cast<int32_t>(port & 1u));
++        }
++
++        // scePad2GetState(int socket)
++        void getState(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++        {
++            (void)rdram;
++            (void)runtime;
++            setReturnS32(ctx, socketHasController(getRegU32(ctx, 4)) ? kPad2StateStable : kPad2StateNoLink);
++        }
++
++        // scePad2GetButtonProfile(int socket, unsigned char *profile) and the
++        // companion capability query: a DualShock 2 supports every button,
++        // both sticks and pressure sensitivity.
++        void getProfile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++        {
++            (void)runtime;
++            if (!socketHasController(getRegU32(ctx, 4)))
++            {
++                setReturnS32(ctx, -1);
++                return;
++            }
++            uint8_t *profile = getMemPtr(rdram, getRegU32(ctx, 5));
++            if (!profile)
++            {
++                setReturnS32(ctx, -1);
++                return;
++            }
++            std::memset(profile, 0xFF, kPad2ProfileSize);
++            setReturnS32(ctx, kPad2ProfileSize);
++        }
++
++        // scePad2Read(int socket, scePad2ButtonState *data)
++        void read(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++        {
++            const uint32_t socket = getRegU32(ctx, 4);
++            uint8_t *out = getMemPtr(rdram, getRegU32(ctx, 5));
++            if (!out || !socketHasController(socket))
++            {
++                setReturnS32(ctx, -1);
++                return;
++            }
++
++            uint8_t pad[32]{};
++            if (!runtime || !runtime->padBackend().readState(static_cast<int>(socket), 0, pad, sizeof(pad)))
++            {
++                std::memset(pad, 0, sizeof(pad));
++                pad[2] = pad[3] = 0xFF;
++                pad[4] = pad[5] = pad[6] = pad[7] = 0x80;
++            }
++
++            // Buttons (active low, libpad bit order) and sticks: RX, RY, LX, LY.
++            std::memcpy(out, pad + 2, 6);
++
++            // Pressures: right, left, up, down, triangle, circle, cross, square, L1, R1, L2, R2.
++            const uint16_t pressed = static_cast<uint16_t>(~(pad[2] | (pad[3] << 8)));
++            static constexpr uint16_t kPressureOrder[12] = {
++                1u << 5, 1u << 7, 1u << 4, 1u << 6,     // right, left, up, down
++                1u << 12, 1u << 13, 1u << 14, 1u << 15, // triangle, circle, cross, square
++                1u << 10, 1u << 11, 1u << 8, 1u << 9,   // L1, R1, L2, R2
++            };
++            for (int i = 0; i < 12; ++i)
++            {
++                out[6 + i] = (pressed & kPressureOrder[i]) ? 0xFF : 0x00;
++            }
++            setReturnS32(ctx, kPad2ReadSize);
++        }
++    }
++}
+diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
+index 1e38bd4..4bc854e 100644
+--- a/ps2xRuntime/src/lib/game_overrides.cpp
++++ b/ps2xRuntime/src/lib/game_overrides.cpp
+@@ -181,3 +181,48 @@ namespace ps2_game_overrides
+         }
+     }
+ }
++
++// ---------------------------------------------------------------------------
++// Per-game overrides
++// ---------------------------------------------------------------------------
++namespace ps2_stubs
++{
++    namespace libpad2_hle
++    {
++        void dbcInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
++        void createSocket(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
++        void getState(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
++        void getProfile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
++        void read(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
++    }
++}
++
++namespace
++{
++    // The IPU (MPEG decoder) is not emulated. Skip work that would wait on it.
++    void skipIpuWork(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        (void)rdram;
++        (void)ctx;
++        (void)runtime;
++    }
++
++    // Onimusha 3: Demon Siege (USA), SLUS_206.94.
++    void applyOnimusha3(PS2Runtime &runtime)
++    {
++        using namespace ps2_stubs::libpad2_hle;
++        // libpad2 2800 / libdbc 2800 (controller input).
++        runtime.replaceFunction(0x00159AD0u, &dbcInit);      // sceDbcInit
++        runtime.replaceFunction(0x00159268u, &createSocket); // scePad2CreateSocket
++        runtime.replaceFunction(0x00159570u, &getState);     // scePad2GetState
++        runtime.replaceFunction(0x001594A0u, &getProfile);   // scePad2GetButtonProfile
++        runtime.replaceFunction(0x00159050u, &getProfile);   // analog/pressure capability query
++        runtime.replaceFunction(0x001593C8u, &read);         // scePad2Read
++
++        // IPU still-image decode (one macroblock strip per call) for full-screen
++        // backgrounds. Without an IPU the image is left blank instead of hanging.
++        runtime.replaceFunction(0x0028CE60u, &skipIpuWork);
++    }
++}
++
++PS2_REGISTER_GAME_OVERRIDE("Onimusha 3 (SLUS-20694)", "SLUS_206.94", 0x00100008u, 0u, &applyOnimusha3)

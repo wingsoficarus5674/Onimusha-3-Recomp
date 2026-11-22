@@ -1,0 +1,29 @@
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index cf4fdc6..54d971d 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -148,10 +148,23 @@ namespace ps2x::iop::detail
+         case 10:
+         case 11:
+         case 14: // InitRpc
+-        case 15:
+         case 16:
+             setV0(0);
+             return true;
++        case 15: // sceSifBindRpc(client, sid, mode), IOP -> EE
++        {
++            // EE-side RPC servers live in the runtime, not in IOP memory, so there is no
++            // server descriptor to point at. Drivers (e.g. Capcom's SNDDRV binding to the
++            // game's 0x77777779) loop until client->server (offset 0x24) is non-zero before
++            // registering their own servers, so report the binding as established.
++            constexpr uint32_t kClientServerOffset = 0x24u;
++            const uint32_t client = cpu.gpr[4];
++            const uint32_t sid = cpu.gpr[5];
++            if (client != 0u && m_memory.ownsRamRange(client, kClientServerOffset + 4u))
++                m_memory.write32(client + kClientServerOffset, sid != 0u ? sid : 1u);
++            setV0(0);
++            return true;
++        }
+         case 12: // sceSifSendCmd
+         case 13: // isceSifSendCmd
+         {
