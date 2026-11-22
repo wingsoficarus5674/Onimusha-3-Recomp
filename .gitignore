@@ -9,3 +9,8 @@ build/
 output/
 ghidra_project/
 *.log
+# Runtime output (memory cards, logs, UI state)
+mc0/
+mc1/
+ps2_log.txt
+imgui.ini
