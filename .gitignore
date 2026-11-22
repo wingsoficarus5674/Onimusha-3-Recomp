@@ -1,0 +1,11 @@
+# Game files - never commit (copyrighted; users must dump their own disc)
+*.iso
+game/
+# Downloaded third-party tools (fetched by 0_setup.ps1)
+downloads/
+tools/
+# Build / generated output
+build/
+output/
+ghidra_project/
+*.log
