@@ -16,7 +16,11 @@ rem Sync generated files: copy only changed ones (keeps incremental builds fast)
 echo Syncing generated sources (a minute or two)...
 powershell -NoProfile -ExecutionPolicy Bypass -File sync_generated.ps1 -Src output -Dst "%RT%\src\runner" -Filter *.cpp -Prune
 if errorlevel 1 (echo Sync FAILED. & exit /b 1)
-powershell -NoProfile -ExecutionPolicy Bypass -File sync_generated.ps1 -Src output -Dst "%RT%\include" -Filter ps2_recompiled_*.h
+powershell -NoProfile -ExecutionPolicy Bypass -File sync_generated.ps1 -Src output -Dst "%RT%\include" -Filter ps2_recompiled_functions.h
+if errorlevel 1 (echo Sync FAILED. & exit /b 1)
+rem ps2_recompiled_stubs.h only repeats declarations from ps2_recompiled_functions.h; a fixed copy
+rem means a new stub binding rebuilds a few files instead of all ~64,000
+powershell -NoProfile -ExecutionPolicy Bypass -File sync_generated.ps1 -Src patches -Dst "%RT%\include" -Filter ps2_recompiled_stubs.h
 if errorlevel 1 (echo Sync FAILED. & exit /b 1)
 rem Apply this project's fixes to PS2Recomp (skips any already applied)
 for %%P in (patches\*.patch) do (

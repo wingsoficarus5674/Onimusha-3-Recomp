@@ -68,6 +68,10 @@ Those labels point at data, not code. The heuristic fallback config gives about 
 
 ## Patches to PS2Recomp
 
+`patches\ps2_recompiled_stubs.h` replaces the recompiler's stubs header with a fixed one. Every declaration
+in the generated header is already in `ps2_recompiled_functions.h`, and every generated file includes it, so
+keeping it constant means a new stub binding recompiles a few files instead of all ~64,000.
+
 `patches\*.patch` are fixes this game needs in PS2Recomp itself. `4_build_runtime.bat` applies them automatically.
 
 - `0001-skip-empty-out-of-range-elf-segments.patch`: SLUS_206.94 has about 200 empty overlay placeholder segments.
@@ -104,7 +108,32 @@ so `sceCdInit` (0x0011D758) waited forever for the CD server (RPC 0x80000592) on
 | 0x0010F608 | `sceSifExecRequest` | runs a server function, replies with 0x80000008 |
 | 0x0010F7D0 | `sceSifRpcLoop` | GetNextRequest/ExecRequest/SleepThread loop |
 
-Also identified, not bound: `sceCdInit` 0x0011D758, `printf` 0x0010DF48.
+### libcdvd (disc), libfileio, IOP heap, loadfile
+
+The runtime has no CD/file/loadfile RPC servers on its IOP side; it implements these libraries on
+the EE side instead, reading from the `game\` folder. Identified by RPC service ID and function number:
+
+| Address | Function | Evidence |
+|---|---|---|
+| 0x0011CD98 | `sceCdCallback` | stores callback, returns previous |
+| 0x0011CEE8 | `sceCdSearchFile` | SID 0x80000597, 300-byte request |
+| 0x0011D390 | `sceCdNcmdDiskReady` | N-cmd 0xE |
+| 0x0011D428 | `sceCdSync` | CheckStatRpc on the N-cmd client |
+| 0x0011D4C8 | `sceCdSyncS` | CheckStatRpc on the S-cmd client |
+| 0x0011D758 | `sceCdInit` | SID 0x80000592 |
+| 0x0011DA38 | `sceCdDiskReady` | SID 0x8000059A |
+| 0x0011DE38 | `sceCdRead` | N-cmd 1, 0x18-byte request |
+| 0x0011E018 | `sceCdSeek` | N-cmd 5 |
+| 0x0011E0E8 / 0x0011E180 / 0x0011E218 | `sceCdGetDiskType` / `sceCdGetError` / `sceCdBreak` | S-cmd 3 / 4 / 0x16 |
+| 0x0011E2D0 | `sceCdMmode` | S-cmd via table; called with 2 (DVD) at boot |
+| 0x0010FEA0 / 0x00110138 | `sceFsInit` / `sceFsReset` | binds SID 0x80000001 / clears its client |
+| 0x00110170 0x001103F8 0x001107B0 0x00110A10 0x00110578 0x00110CD0 | `sceOpen` `sceClose` `sceRead` `sceWrite` `sceLseek` `sceIoctl` | fileio cmds 0 1 2 3 4 5 |
+| 0x00112F28 0x00112FB0 0x001130A0 0x00113138 | `sceSifInitIopHeap` `sceSifAllocIopHeap` `sceSifFreeIopHeap` `sceSifLoadIopHeap` | SID 0x80000003, cmds 1 2 3 |
+| 0x00113608 0x00113640 0x00113E78 | `sceSifLoadFileReset` `sceSifLoadModuleBuffer` `sceSifLoadModule` | SID 0x80000006; LoadModule is called for the 12 IRX paths at boot |
+| 0x001141D8 0x00114330 0x00114358 0x001143A8 | `sceSifResetIop` `sceSifIsAliveIop` `sceSifSyncIop` `sceSifRebootIop` | SIF regs/DMA; RebootIop is called with IOPRP280.IMG |
+
+Also identified, not bound: `printf` 0x0010DF48; main 0x00159020 → game init 0x0027A1C0.
+
 
 ## After the first boot
 
