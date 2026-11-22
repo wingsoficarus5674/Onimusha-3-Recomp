@@ -57,7 +57,8 @@ Those labels point at data, not code. The heuristic fallback config gives about 
 1. `1_ghidra_analyze.bat` runs Ghidra's auto-analysis without opening the Ghidra window and then runs `ExportPS2Functions.java`.
    It writes `config\onimusha3.toml` and `config\onimusha3_functions.csv`, and keeps the project
    in `ghidra_project\`. Expect it to take 15–60 minutes. Everything it prints is saved to
-   `config\1_ghidra_analyze_output.txt`.
+   `config\1_ghidra_analyze_output.txt`. Ghidra's launcher can't handle `(` `)` in paths, so the script
+   temporarily maps this folder to a free drive letter (P:–Z:) with `subst` and removes it afterwards.
 2. `2_build_tools.bat` builds `ps2_recomp.exe` and `ps2_analyzer.exe`.
 3. `3_recompile.bat` turns the MIPS code into C++ in `output\`. The log goes to `recompile.log`. If there's no Ghidra config,
    it falls back to the analyzer config.
