@@ -18,6 +18,10 @@ del /q "%RT%\include\ps2_recompiled_functions.h" "%RT%\include\ps2_recompiled_st
 echo Copying generated sources...
 copy /y output\*.cpp "%RT%\src\runner\" >nul
 copy /y output\*.h   "%RT%\include\" >nul
+rem Apply this project's fixes to PS2Recomp (skips any already applied)
+for %%P in (patches\*.patch) do (
+  git apply --reverse --check --directory=tools/PS2Recomp "%%P" >nul 2>&1 || git apply --directory=tools/PS2Recomp "%%P" || (echo Failed to apply %%P & exit /b 1)
+)
 cmake -S tools\PS2Recomp -B build\runtime -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF
 if errorlevel 1 (echo CMake configure FAILED. & exit /b 1)
 cmake --build build\runtime --config Release --parallel --target ps2EntryRunner

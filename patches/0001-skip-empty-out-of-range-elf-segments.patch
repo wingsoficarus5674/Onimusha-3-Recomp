@@ -1,0 +1,21 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..5e80872 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -881,6 +881,16 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
+         const uint64_t regionSize = scratch ? static_cast<uint64_t>(PS2_SCRATCHPAD_SIZE)
+                                             : static_cast<uint64_t>(PS2_RAM_SIZE);
+         const uint64_t segmentMemEnd = static_cast<uint64_t>(physAddr) + static_cast<uint64_t>(ph.memsz);
++        if (segmentMemEnd > regionSize && ph.filesz == 0u)
++        {
++            // Empty placeholder segment (e.g. overlay slots) outside guest memory: nothing to load.
++            std::cerr << "Skipping empty ELF segment " << i << " outside "
++                      << (scratch ? "scratchpad" : "RDRAM")
++                      << " (vaddr=0x" << std::hex << ph.vaddr
++                      << " memsz=0x" << ph.memsz << std::dec << ")." << std::endl;
++            continue;
++        }
++
+         if (segmentMemEnd > regionSize)
+         {
+             std::cerr << "ELF segment " << i << " exceeds "

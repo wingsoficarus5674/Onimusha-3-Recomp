@@ -66,6 +66,14 @@ Those labels point at data, not code. The heuristic fallback config gives about 
    Compiling the generated C++ is heavy. Expect a long build and a lot of RAM use.
 5. `5_run.bat` boots `ps2EntryRunner.exe game\SLUS_206.94`.
 
+## Patches to PS2Recomp
+
+`patches\*.patch` are fixes this game needs in PS2Recomp itself. `4_build_runtime.bat` applies them automatically.
+
+- `0001-skip-empty-out-of-range-elf-segments.patch`: SLUS_206.94 has about 200 empty overlay placeholder segments.
+  One is at 0x05000000, outside the 32 MB of RDRAM, and made the loader stop with
+  "ELF segment 198 exceeds RDRAM bounds". Empty segments outside guest memory are now skipped with a warning.
+
 ## After the first boot
 
 These steps follow PS2Recomp's recommended loop:
