@@ -414,7 +414,12 @@ public static class O3Overlays
 '@
 
 if (-not ('O3Overlays' -as [type])) {
-    Add-Type -TypeDefinition $source -Language CSharp
+    if ($PSVersionTable.PSVersion.Major -lt 6) {
+        # Windows PowerShell 5.1: the C# above uses LINQ (System.Core).
+        Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies System.Core
+    } else {
+        Add-Type -TypeDefinition $source -Language CSharp
+    }
 }
 
 if ($Extract) {
