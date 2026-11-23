@@ -1,6 +1,6 @@
 # Onimusha 3 code overlays (used by 3b_recompile_overlays.bat).
 #
-#   overlays.ps1 -Extract  <IMAGE.AFS> <workDir>
+#   overlays.ps1 -Extract  <IMAGE.AFS> <workDir> [<SLUS_206.94>]
 #       Finds the Capcom "LINK" modules (*.ldt) in IMAGE.AFS, decompresses them and writes every
 #       code module ("MWo3" image) as <workDir>\elf\<name>.elf (one load segment at the module's
 #       link address) plus function-start hints in <workDir>\seeds\<name>.seeds for Ghidra.
@@ -136,8 +136,14 @@ public static class O3Overlays
         }
     }
 
-    // Function-start hints: JAL targets, code pointers to a stack-frame prologue, and prologues.
+    // Function-start hints: JAL targets, prologues, and code pointers to a prologue or to code that
+    // follows a "jr ra" (leaf functions).
     static List<uint> Seeds(byte[] img, uint load)
+    {
+        return Seeds(img, load, null);
+    }
+
+    static List<uint> Seeds(byte[] img, uint load, ICollection<uint> external)
     {
         int words = img.Length / 4;
         uint[] w = new uint[words];
@@ -158,17 +164,70 @@ public static class O3Overlays
             if (v >= load + 0x80 && v < end && (v & 3) == 0)
             {
                 int j = (int)((v - load) / 4);
+                bool prologue = false;
                 for (int k = 0; k < 3; k++)
                 {
-                    if (j + k < words && (w[j + k] & 0xFFFF8000u) == 0x27BD8000u) { s.Add(v); break; }
+                    if (j + k < words && (w[j + k] & 0xFFFF8000u) == 0x27BD8000u) { prologue = true; break; }
                 }
+                if (prologue) { s.Add(v); continue; }
+                // Leaf function: the code before it (skipping nop padding) ends with jr ra + delay slot.
+                int b = j - 1, pad = 0;
+                while (b >= 0 && w[b] == 0 && pad < 4) { b--; pad++; }
+                if (b - 1 >= 0 && w[b - 1] == 0x03E00008u && j < words && w[j] != 0) s.Add(v);
+            }
+        }
+        // Addresses the main ELF jumps to or points at inside this module, when they look like the
+        // start of a function (prologue, or right after the previous function's "jr ra").
+        if (external != null)
+        {
+            foreach (uint v in external)
+            {
+                if (v < load + 0x80 || v >= end || (v & 3) != 0) continue;
+                int j = (int)((v - load) / 4);
+                if (w[j] == 0) continue;
+                bool ok = false;
+                for (int k = 0; k < 3 && !ok; k++) ok = j + k < words && (w[j + k] & 0xFFFF8000u) == 0x27BD8000u;
+                if (!ok)
+                {
+                    int b = j - 1, pad = 0;
+                    while (b >= 0 && w[b] == 0 && pad < 4) { b--; pad++; }
+                    ok = b - 1 >= 0 && w[b - 1] == 0x03E00008u;
+                }
+                if (ok) s.Add(v);
             }
         }
         return s.ToList();
     }
 
+    // J/JAL targets and pointer-sized words in the main ELF that fall in the overlay area.
+    static HashSet<uint> MainReferences(string mainElf)
+    {
+        HashSet<uint> refs = new HashSet<uint>();
+        if (string.IsNullOrEmpty(mainElf)) return refs;
+        uint va, memsz;
+        byte[] text = LoadSegment(mainElf, true, out va, out memsz);
+        for (int i = 0; i + 4 <= text.Length; i += 4)
+        {
+            uint v = U32(text, i);
+            uint op = v >> 26;
+            if (op == 2 || op == 3)
+            {
+                uint t = ((va + (uint)i + 4) & 0xF0000000u) | ((v & 0x3FFFFFFu) << 2);
+                if (t >= 0x00C00000u && t < 0x01000000u) refs.Add(t);
+            }
+            if (v >= 0x00C00000u && v < 0x01000000u && (v & 3) == 0) refs.Add(v);
+        }
+        return refs;
+    }
+
     public static int Extract(string afsPath, string workDir)
     {
+        return Extract(afsPath, workDir, null);
+    }
+
+    public static int Extract(string afsPath, string workDir, string mainElf)
+    {
+        HashSet<uint> mainRefs = MainReferences(mainElf);
         string elfDir = Path.Combine(workDir, "elf"), seedDir = Path.Combine(workDir, "seeds");
         Directory.CreateDirectory(elfDir);
         Directory.CreateDirectory(seedDir);
@@ -205,7 +264,7 @@ public static class O3Overlays
                     if (name.Length == 0 || !seen.Add(name)) continue;
                     WriteElf(img, load, Path.Combine(elfDir, name + ".elf"));
                     File.WriteAllText(Path.Combine(seedDir, name + ".seeds"),
-                        string.Join("\n", Seeds(img, load).Select(x => "0x" + x.ToString("x8")).ToArray()));
+                        string.Join("\n", Seeds(img, load, mainRefs).Select(x => "0x" + x.ToString("x8")).ToArray()));
                 }
             }
         }
@@ -243,8 +302,8 @@ public static class O3Overlays
         throw new Exception("no code segment in " + elfPath);
     }
 
-    // Addresses in the main ELF's code that overlay modules jump to (J/JAL) but that have no entry
-    // in the main recompiled function table. Writes a ps2_recomp CSV for them (plus the ELF entry
+    // Addresses in the main ELF's code that overlay modules jump to (J/JAL), or that code pointers
+    // lead to, but that have no entry in the main recompiled function table. Writes a ps2_recomp CSV for them (plus the ELF entry
     // function, which ps2_recomp requires): each covers the rest of the function that contains it in
     // the main function CSV, or runs to the next "jr ra" if no function does.
     public static int MainExtra(string registerCpp, string functionsCsv, string mainElf, string elfDir, string outCsv)
@@ -287,10 +346,60 @@ public static class O3Overlays
             if (start == elfEntry && entryRow == null) entryRow = line;
         }
 
+        // Code pointers: words in the main ELF or a module image that point at the start of a gap
+        // Ghidra left between functions (only nop padding before it), e.g. callbacks that are only
+        // reached through function pointers. Such a target covers the gap up to the next function.
+        ranges.Sort((x, y) => x[0].CompareTo(y[0]));
+        List<uint[]> covered = new List<uint[]>();
+        foreach (uint[] r in ranges)
+        {
+            if (covered.Count > 0 && r[0] <= covered[covered.Count - 1][1])
+            {
+                if (r[1] > covered[covered.Count - 1][1]) covered[covered.Count - 1][1] = r[1];
+            }
+            else covered.Add(new uint[] { r[0], r[1] });
+        }
+        uint[] coveredStarts = covered.Select(c => c[0]).ToArray();
+        Dictionary<uint, uint> gapEnds = new Dictionary<uint, uint>();
+        Func<uint, uint> textWord = a => U32(text, (int)(a - textBase));
+        Action<byte[]> scanPointers = img =>
+        {
+            for (int i = 0; i + 4 <= img.Length; i += 4)
+            {
+                uint v = U32(img, i);
+                if (v < tableBase || v >= tableEnd || (v & 3) != 0 || have.Contains(v) || gapEnds.ContainsKey(v)) continue;
+                int k = Array.BinarySearch(coveredStarts, v);
+                if (k < 0) k = ~k - 1;
+                if (k < 0) continue;
+                if (v < covered[k][1]) continue; // inside an analysed function
+                uint gapStart = covered[k][1];
+                uint gapEnd = (k + 1 < covered.Count) ? covered[k + 1][0] : tableEnd;
+                if (v - gapStart > 0x40 || textWord(v) == 0) continue;
+                bool padding = true;
+                for (uint a = gapStart; a < v; a += 4) { if (textWord(a) != 0) { padding = false; break; } }
+                if (!padding) continue;
+                gapEnds[v] = Math.Min(gapEnd, v + 0x4000u);
+            }
+        };
+        scanPointers(text);
+        foreach (string elf in Directory.GetFiles(elfDir, "*.elf"))
+        {
+            uint load, memsz;
+            scanPointers(LoadSegment(elf, false, out load, out memsz));
+        }
+        foreach (KeyValuePair<uint, uint> g in gapEnds) targets.Add(g.Key);
+
         StringBuilder csv = new StringBuilder("Name,Start,End,Size\n");
         int count = 0;
         foreach (uint t in targets)
         {
+            if (gapEnds.ContainsKey(t))
+            {
+                uint gEnd = gapEnds[t];
+                csv.AppendFormat("extra_{0:x8},0x{0:X8},0x{1:X8},{2}\n", t, gEnd, gEnd - t);
+                count++;
+                continue;
+            }
             uint end = 0;
             foreach (uint[] r in ranges)
             {
@@ -423,7 +532,9 @@ if (-not ('O3Overlays' -as [type])) {
 }
 
 if ($Extract) {
-    $n = [O3Overlays]::Extract((Resolve-Path $A).Path, [IO.Path]::GetFullPath($B))
+    # optional 3rd argument: the main ELF, whose jumps/pointers into the overlay area add function seeds
+    $main = $null; if ($C) { $main = (Resolve-Path $C).Path }
+    $n = [O3Overlays]::Extract((Resolve-Path $A).Path, [IO.Path]::GetFullPath($B), $main)
     Write-Host "Extracted $n code modules."
 }
 elseif ($Generate) {

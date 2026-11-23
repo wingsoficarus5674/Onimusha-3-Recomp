@@ -26,7 +26,7 @@ if exist "%WORK%" rmdir /s /q "%WORK%"
 mkdir "%WORK%\csv" "%WORK%\recomp" "%WORK%\ghidra_scripts" "%WORK%\ghidra_project"
 
 echo [1/4] Extracting code modules from IMAGE.AFS...
-powershell -NoProfile -ExecutionPolicy Bypass -File overlays.ps1 -Extract game\IMAGE\IMAGE.AFS "%WORK%"
+powershell -NoProfile -ExecutionPolicy Bypass -File overlays.ps1 -Extract game\IMAGE\IMAGE.AFS "%WORK%" game\SLUS_206.94
 if errorlevel 1 (echo Extraction FAILED. & exit /b 1)
 copy /y ghidra_scripts\SeedOverlayFunctions.java "%WORK%\ghidra_scripts\" >nul
 powershell -NoProfile -ExecutionPolicy Bypass -File overlays.ps1 -GhidraScript tools\PS2Recomp\ps2xRecomp\tools\ghidra\ExportPS2Functions.java "%WORK%\ghidra_scripts\ExportPS2Overlay.java"
