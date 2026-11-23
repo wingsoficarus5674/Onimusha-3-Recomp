@@ -57,9 +57,10 @@ Those labels point at data, not code. The heuristic fallback config gives about 
 1. `1_ghidra_analyze.bat` runs Ghidra's auto-analysis without opening the Ghidra window and then runs `ExportPS2Functions.java`.
    It writes `config\onimusha3.toml` and `config\onimusha3_functions.csv`, and keeps the project
    in `ghidra_project\`. Expect it to take 15–60 minutes. Everything it prints is saved to
-   `config\1_ghidra_analyze_output.txt`. Ghidra's launcher can't handle `(` `)` in paths, so the script
-   temporarily maps this folder to a free drive letter (P:–Z:) with `subst` and removes it afterwards.
-2. `2_build_tools.bat` builds `ps2_recomp.exe` and `ps2_analyzer.exe`.
+   `config\1_ghidra_analyze_output.txt`. Ghidra's own launcher (`analyzeHeadless.bat`) can't handle `(` `)`
+   in paths, so `ghidra_headless.ps1` starts Ghidra's Java entry point directly instead.
+2. `2_build_tools.bat` applies the patches below to PS2Recomp and builds `ps2_recomp.exe` and `ps2_analyzer.exe`.
+   Re-run it (then 3, 3b and 4) whenever a patch that changes the recompiler is added.
 3. `3_recompile.bat` turns the MIPS code into C++ in `output\`. The log goes to `recompile.log`. If there's no Ghidra config,
    it falls back to the analyzer config.
 3b. `3b_recompile_overlays.bat` recompiles the game's code overlays (see "Code overlays" below): it extracts the
@@ -129,6 +130,12 @@ keeping it constant means a new stub binding recompiles a few files instead of a
 - `0017-dma-recv-and-spr-interleave.patch`: `sceDmaRecv`, `sceDmaRecvN` and `sceDmaRecvI` were unimplemented
   (the runtime stopped with "Unimplemented PS2 stub called: sceDmaRecvN" after the warning screen); they now
   program the channel like libdma. Scratchpad DMA also supports interleave mode (D_SQWC).
+- `0018-fpu-sqrt-uses-ft-and-vrsqrt-numerator.patch` (recompiler): `SQRT.S fd, ft` takes its operand from
+  the ft field, but the recompiler read fs, so 309 of the game's 511 square roots used the wrong register.
+  `VRSQRT` ignored its numerator.
+- `0019-ee-thread-context-vf0-constant.patch`: threads created by the game started with VU0 `vf0` = 0
+  instead of the hardwired (0,0,0,1), so every VU0 matrix routine that uses `vf0` (unit matrix, quaternion
+  to matrix, the `w` = 1 row) produced zeros and gameplay rendered nothing.
 
 ## Manual bindings
 
@@ -222,6 +229,9 @@ in this runtime a guest thread that never makes a syscall would never yield.
 14. ~~Black screens instead of the middleware logos and warning~~ (patch 0016)
 15. ~~"Unimplemented PS2 stub called: sceDmaRecvN" after the warning screen~~ (patch 0017)
 16. Reaches the title screen ("PRESS START BUTTON") and the main menu.
+17. ~~Black screen in gameplay: every vertex at 0,0~~ (patches 0018, 0019; libvu0 is no longer replaced by
+    the runtime's HLE versions, the game's own routines are recompiled)
+18. NEW GAME starts and the 3D gameplay renders.
 
 ## Code overlays
 

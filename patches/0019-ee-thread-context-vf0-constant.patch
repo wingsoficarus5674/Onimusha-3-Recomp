@@ -1,0 +1,14 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 5e99e2d..d6f8892 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -493,6 +493,9 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
+     }
+ 
+     target->context = R5900Context{};
++    // VU0 vf0 is hardwired to (0,0,0,1); recompiled VU0 macro code reads it as a constant
++    // (identity rows, w = 1), so every thread's context must start with it set.
++    target->context.vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
+     target->context.pc = target->entry;
+     target->arg = arg;
+     target->suspendCount = 0;
