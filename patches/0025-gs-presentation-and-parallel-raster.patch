@@ -1,0 +1,720 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index 2421f9e..5cebb7b 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -16,6 +16,10 @@ public:
+     void Reset() override;
+ 
+     void Submit(const GSPrimitiveBatch &batch) override;
++    // Draws the batches in order, with the same result as calling Submit for each one. Runs of
++    // primitives that cannot affect each other through VRAM are split into horizontal bands and
++    // rasterised on several threads.
++    void SubmitBatches(const GSPrimitiveBatch *const *batches, size_t count);
+     void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override;
+     void BeginTransfer(const GSTransferCommand &command) override;
+     void UploadImage(const uint8_t *data, uint32_t sizeBytes) override;
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 08b477c..15b3079 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -14,6 +14,12 @@
+ #include <fstream>
+ #include <iostream>
+ #include <stdexcept>
++#include <condition_variable>
++#include <cstdlib>
++#include <functional>
++#include <mutex>
++#include <thread>
++#include <vector>
+ 
+ using namespace GSInternal;
+ 
+@@ -665,14 +671,351 @@ uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw
+     return m_readVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y);
+ }
+ 
++namespace
++{
++    // While a thread rasterises a band of a parallel draw it reads textures through its own
++    // page cache (the member cache belongs to the sequential path).
++    thread_local GSMem::TexturePageCache *tl_bandTextureCache = nullptr;
++}
++
+ uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)
+ {
+     if (!m_vram)
+         return 0u;
+ 
++    if (tl_bandTextureCache)
++        return GSMem::ReadTexture(*tl_bandTextureCache, m_vram, psm, base, bw, x, y);
+     return GSMem::ReadTexture(m_texturePageCache, m_vram, psm, base, bw, x, y);
+ }
+ 
++namespace
++{
++    // Fixed pool of helper threads for band-parallel rasterisation.
++    class RasterPool
++    {
++    public:
++        static RasterPool &instance()
++        {
++            static RasterPool pool;
++            return pool;
++        }
++
++        unsigned participants() const noexcept { return static_cast<unsigned>(m_threads.size()) + 1u; }
++
++        // Calls job(index) once for every index in [0, participants()); the caller runs index 0.
++        void run(const std::function<void(unsigned)> &job)
++        {
++            if (m_threads.empty())
++            {
++                job(0u);
++                return;
++            }
++            {
++                std::lock_guard<std::mutex> lock(m_mutex);
++                m_job = &job;
++                m_remaining = static_cast<unsigned>(m_threads.size());
++                ++m_generation;
++            }
++            m_start.notify_all();
++            job(0u);
++            std::unique_lock<std::mutex> lock(m_mutex);
++            m_done.wait(lock, [this]()
++                        { return m_remaining == 0u; });
++            m_job = nullptr;
++        }
++
++    private:
++        RasterPool()
++        {
++            unsigned count = 0u;
++            if (const char *env = std::getenv("PS2X_GS_THREADS"))
++            {
++                count = static_cast<unsigned>(std::max(1l, std::strtol(env, nullptr, 10)));
++            }
++            else
++            {
++                // Leave a core each for the EE and the host/presentation thread.
++                const unsigned hw = std::thread::hardware_concurrency();
++                count = hw > 2u ? hw - 2u : 1u;
++            }
++            count = std::min(count, 16u);
++            for (unsigned i = 1u; i < count; ++i)
++                m_threads.emplace_back([this, i]()
++                                       { workerLoop(i); });
++        }
++
++        ~RasterPool()
++        {
++            {
++                std::lock_guard<std::mutex> lock(m_mutex);
++                m_stop = true;
++            }
++            m_start.notify_all();
++            for (std::thread &thread : m_threads)
++                thread.join();
++        }
++
++        void workerLoop(unsigned index)
++        {
++            uint64_t seen = 0u;
++            for (;;)
++            {
++                const std::function<void(unsigned)> *job = nullptr;
++                {
++                    std::unique_lock<std::mutex> lock(m_mutex);
++                    m_start.wait(lock, [&]()
++                                 { return m_stop || m_generation != seen; });
++                    if (m_stop)
++                        return;
++                    seen = m_generation;
++                    job = m_job;
++                }
++                (*job)(index);
++                {
++                    std::lock_guard<std::mutex> lock(m_mutex);
++                    --m_remaining;
++                }
++                m_done.notify_one();
++            }
++        }
++
++        std::vector<std::thread> m_threads;
++        std::mutex m_mutex;
++        std::condition_variable m_start;
++        std::condition_variable m_done;
++        const std::function<void(unsigned)> *m_job = nullptr;
++        uint64_t m_generation = 0u;
++        unsigned m_remaining = 0u;
++        bool m_stop = false;
++    };
++
++    constexpr uint32_t kVramBytes = 4u * 1024u * 1024u;
++    constexpr uint32_t kPageBytes = 8192u;
++    constexpr int kBandRows = 16;
++
++    struct VramRange
++    {
++        uint32_t begin = 0u;
++        uint32_t end = 0u; // exclusive; > kVramBytes means the range wraps and overlaps anything
++    };
++
++    bool rangesOverlap(const VramRange &a, const VramRange &b)
++    {
++        if (a.end > kVramBytes || b.end > kVramBytes)
++            return true;
++        return a.begin < b.end && b.begin < a.end;
++    }
++
++    void pageDims(uint8_t psm, uint32_t &width, uint32_t &height)
++    {
++        switch (psm)
++        {
++        case GS_PSM_CT16:
++        case GS_PSM_CT16S:
++        case GS_PSM_Z16:
++        case GS_PSM_Z16S:
++            width = 64u;
++            height = 64u;
++            return;
++        case GS_PSM_T8:
++            width = 128u;
++            height = 64u;
++            return;
++        case GS_PSM_T4:
++            width = 128u;
++            height = 128u;
++            return;
++        default: // 32-bit layouts, including T8H/T4HL/T4HH
++            width = 64u;
++            height = 32u;
++            return;
++        }
++    }
++
++    // Conservative page-granular range of a buffer `widthPixels` wide and `rows` tall.
++    VramRange bufferRange(uint32_t baseBlock, uint32_t widthPixels, uint32_t rows, uint8_t psm)
++    {
++        uint32_t pw = 64u, ph = 32u;
++        pageDims(psm, pw, ph);
++        const uint32_t begin = (baseBlock * 256u) & ~(kPageBytes - 1u);
++        const uint64_t pagesPerRow = std::max<uint64_t>(1u, (static_cast<uint64_t>(widthPixels) + pw - 1u) / pw);
++        const uint64_t pageRows = std::max<uint64_t>(1u, (static_cast<uint64_t>(rows) + ph - 1u) / ph);
++        const uint64_t end = static_cast<uint64_t>(begin) + (pagesPerRow * pageRows + 1u) * kPageBytes;
++        return VramRange{begin, static_cast<uint32_t>(std::min<uint64_t>(end, 0xFFFFFFFFull))};
++    }
++
++    struct WriteTarget
++    {
++        uint32_t base = 0u;
++        uint32_t width = 0u;
++        uint8_t psm = 0u;
++        VramRange range;
++    };
++
++    struct PrimitiveFootprint
++    {
++        int minY = 0;
++        int maxY = -1;
++        bool hasTexture = false;
++        VramRange texture;
++        WriteTarget targets[2];
++        int targetCount = 0;
++        uint64_t area = 0u;
++    };
++
++    PrimitiveFootprint footprintOf(const GSPrimitiveBatch &batch)
++    {
++        PrimitiveFootprint fp;
++        const GSDrawState &state = batch.state;
++        const GSContext &ctx = state.context;
++        const int count = std::max<int>(1, std::min<int>(batch.vertexCount, 3));
++        float minXf = batch.vertices[0].x, maxXf = minXf;
++        float minYf = batch.vertices[0].y, maxYf = minYf;
++        for (int i = 1; i < count; ++i)
++        {
++            minXf = std::min(minXf, batch.vertices[i].x);
++            maxXf = std::max(maxXf, batch.vertices[i].x);
++            minYf = std::min(minYf, batch.vertices[i].y);
++            maxYf = std::max(maxYf, batch.vertices[i].y);
++        }
++        const float ofx = static_cast<float>(ctx.xyoffset.ofx >> 4);
++        const float ofy = static_cast<float>(ctx.xyoffset.ofy >> 4);
++        const int minX = std::max<int>(ctx.scissor.x0, static_cast<int>(std::floor(minXf - ofx)) - 1);
++        const int maxX = std::min<int>(ctx.scissor.x1, static_cast<int>(std::ceil(maxXf - ofx)) + 1);
++        fp.minY = std::max<int>(ctx.scissor.y0, static_cast<int>(std::floor(minYf - ofy)) - 1);
++        fp.maxY = std::min<int>(ctx.scissor.y1, static_cast<int>(std::ceil(maxYf - ofy)) + 1);
++        if (maxX >= minX && fp.maxY >= fp.minY)
++            fp.area = static_cast<uint64_t>(maxX - minX + 1) * static_cast<uint64_t>(fp.maxY - fp.minY + 1);
++
++        const uint32_t fbw = std::max<uint32_t>(ctx.frame.fbw, 1u) * 64u;
++        const uint32_t rows = static_cast<uint32_t>(std::max<int>(ctx.scissor.y1, 0)) + 1u;
++        if (ctx.frame.fbmsk != 0xFFFFFFFFu)
++        {
++            const uint32_t base = framePageBaseToBlock(ctx.frame.fbp);
++            fp.targets[fp.targetCount++] = WriteTarget{base, fbw, ctx.frame.psm, bufferRange(base, fbw, rows, ctx.frame.psm)};
++        }
++        if (!ctx.zbuf.zmask)
++        {
++            const uint32_t base = framePageBaseToBlock(ctx.zbuf.zbp);
++            fp.targets[fp.targetCount++] = WriteTarget{base, fbw, ctx.zbuf.psm, bufferRange(base, fbw, rows, ctx.zbuf.psm)};
++        }
++        if (state.prim.tme)
++        {
++            fp.hasTexture = true;
++            const uint32_t texWidth = std::max<uint32_t>(std::max<uint32_t>(ctx.tex0.tbw, 1u) * 64u, state.textureWidth);
++            fp.texture = bufferRange(ctx.tex0.tbp0, texWidth, std::max<uint32_t>(state.textureHeight, 1u), ctx.tex0.psm);
++        }
++        return fp;
++    }
++}
++
++void GSCpuBackend::SubmitBatches(const GSPrimitiveBatch *const *batches, size_t count)
++{
++    std::lock_guard<std::mutex> lock(m_mutex);
++    if (!m_vram || count == 0u)
++        return;
++
++    RasterPool &pool = RasterPool::instance();
++    const unsigned participants = pool.participants();
++    if (participants <= 1u)
++    {
++        for (size_t i = 0; i < count; ++i)
++            if (batches[i]->vertexCount != 0u)
++                DrawPrimitive(*batches[i]);
++        return;
++    }
++
++    std::vector<PrimitiveFootprint> footprints;
++    std::vector<VramRange> segmentReads;
++    std::vector<WriteTarget> segmentWrites;
++    footprints.reserve(count);
++
++    size_t begin = 0u;
++    while (begin < count)
++    {
++        // Grow a segment of primitives that don't interact through VRAM except by drawing to
++        // the same buffers with the same layout (which keeps every pixel in one band).
++        footprints.clear();
++        segmentReads.clear();
++        segmentWrites.clear();
++        uint64_t segmentArea = 0u;
++        size_t end = begin;
++        while (end < count)
++        {
++            const GSPrimitiveBatch &batch = *batches[end];
++            PrimitiveFootprint fp = footprintOf(batch);
++            bool hazard = false;
++            if (fp.hasTexture)
++                for (const WriteTarget &w : segmentWrites)
++                    hazard = hazard || rangesOverlap(fp.texture, w.range);
++            for (int t = 0; t < fp.targetCount && !hazard; ++t)
++            {
++                const WriteTarget &target = fp.targets[t];
++                for (const VramRange &r : segmentReads)
++                    hazard = hazard || rangesOverlap(target.range, r);
++                for (const WriteTarget &w : segmentWrites)
++                {
++                    const bool sameLayout = w.base == target.base && w.width == target.width && w.psm == target.psm;
++                    hazard = hazard || (!sameLayout && rangesOverlap(target.range, w.range));
++                }
++            }
++            if (hazard && end > begin)
++                break;
++            if (fp.hasTexture)
++                segmentReads.push_back(fp.texture);
++            for (int t = 0; t < fp.targetCount; ++t)
++            {
++                bool known = false;
++                for (const WriteTarget &w : segmentWrites)
++                    known = known || (w.base == fp.targets[t].base && w.width == fp.targets[t].width && w.psm == fp.targets[t].psm);
++                if (!known)
++                    segmentWrites.push_back(fp.targets[t]);
++            }
++            segmentArea += fp.area;
++            footprints.push_back(fp);
++            ++end;
++        }
++
++        if (segmentArea < 16384u || end - begin == 0u)
++        {
++            for (size_t i = begin; i < end; ++i)
++                if (batches[i]->vertexCount != 0u)
++                    DrawPrimitive(*batches[i]);
++        }
++        else
++        {
++            const std::function<void(unsigned)> job = [&](unsigned index)
++            {
++                thread_local GSMem::TexturePageCache bandCache;
++                bandCache.Invalidate();
++                tl_bandTextureCache = &bandCache;
++                for (size_t i = begin; i < end; ++i)
++                {
++                    const GSPrimitiveBatch &batch = *batches[i];
++                    const PrimitiveFootprint &fp = footprints[i - begin];
++                    if (batch.vertexCount == 0u || fp.maxY < fp.minY)
++                        continue;
++                    for (int band = fp.minY / kBandRows; band <= fp.maxY / kBandRows; ++band)
++                    {
++                        if (static_cast<unsigned>(band) % participants != index)
++                            continue;
++                        GSPrimitiveBatch clipped = batch;
++                        GSScissorReg &scissor = clipped.state.context.scissor;
++                        scissor.y0 = static_cast<uint16_t>(std::max<int>(scissor.y0, band * kBandRows));
++                        scissor.y1 = static_cast<uint16_t>(std::min<int>(scissor.y1, band * kBandRows + kBandRows - 1));
++                        if (scissor.y0 <= scissor.y1)
++                            DrawPrimitive(clipped);
++                    }
++                }
++                tl_bandTextureCache = nullptr;
++            };
++            pool.run(job);
++            m_texturePageCache.Invalidate();
++        }
++        begin = end;
++    }
++}
++
+ void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+@@ -1127,10 +1470,15 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+     const float fx = sampleU - static_cast<float>(u0);
+     const float fy = sampleV - static_cast<float>(v0);
+ 
++    // A zero weight makes a sample's contribution exactly zero (see lerpChannel), so the
++    // texels it would multiply aren't needed. 1:1 sprites and screen copies hit this on
++    // every pixel.
++    if (fx == 0.0f && fy == 0.0f)
++        return samplePoint(u0, v0);
+     const uint32_t c00 = samplePoint(u0, v0);
+-    const uint32_t c10 = samplePoint(u1, v0);
+-    const uint32_t c01 = samplePoint(u0, v1);
+-    const uint32_t c11 = samplePoint(u1, v1);
++    const uint32_t c10 = fx != 0.0f ? samplePoint(u1, v0) : c00;
++    const uint32_t c01 = fy != 0.0f ? samplePoint(u0, v1) : c00;
++    const uint32_t c11 = (fx != 0.0f && fy != 0.0f) ? samplePoint(u1, v1) : (fx != 0.0f ? c10 : c01);
+ 
+     const uint8_t r = lerpChannel(static_cast<uint8_t>(c00 & 0xFFu),
+                                   static_cast<uint8_t>(c10 & 0xFFu),
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+index ee12406..166ca44 100644
+--- a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -1,16 +1,47 @@
+ #include "gs_threaded_backend.h"
+ 
++#include "runtime/gs/gs_cpu_backend.h"
++
++#include <algorithm>
++#include <cmath>
++
+ #include <utility>
+ 
+ namespace
+ {
+-    // Bound the queue so a producer far ahead of the rasteriser can't use unbounded memory.
+-    constexpr size_t kMaxQueuedCommands = 65536u;
++    // Bound the queue so a producer far ahead of the rasteriser waits for it (as the EE waits for
++    // a busy GS on hardware) instead of building up unbounded memory and presentation latency.
++    constexpr size_t kMaxQueuedCommands = 16384u;
++    // Also bound the queued work by its estimated pixel cost (about a frame's worth), so
++    // presentation never waits behind seconds of queued drawing.
++    constexpr uint64_t kMaxQueuedCost = 1024u * 1024u;
++    constexpr uint32_t kCommandBaseCost = 16u;
++
++    uint32_t estimateDrawCost(const GSPrimitiveBatch &batch)
++    {
++        const int count = std::max<int>(1, std::min<int>(batch.vertexCount, 3));
++        float minX = batch.vertices[0].x, maxX = minX, minY = batch.vertices[0].y, maxY = minY;
++        for (int i = 1; i < count; ++i)
++        {
++            minX = std::min(minX, batch.vertices[i].x);
++            maxX = std::max(maxX, batch.vertices[i].x);
++            minY = std::min(minY, batch.vertices[i].y);
++            maxY = std::max(maxY, batch.vertices[i].y);
++        }
++        const auto &scissor = batch.state.context.scissor;
++        const float w = std::min(maxX - minX + 1.0f, static_cast<float>(scissor.x1 - scissor.x0 + 1));
++        const float h = std::min(maxY - minY + 1.0f, static_cast<float>(scissor.y1 - scissor.y0 + 1));
++        float area = (w > 0.0f && h > 0.0f) ? w * h : 0.0f;
++        if (count == 3)
++            area *= 0.5f;
++        return kCommandBaseCost + static_cast<uint32_t>(std::min(area, 4.0e6f));
++    }
+ }
+ 
+ GSThreadedBackend::GSThreadedBackend(std::unique_ptr<GSRasterBackend> inner)
+     : m_inner(std::move(inner))
+ {
++    m_cpuInner = dynamic_cast<GSCpuBackend *>(m_inner.get());
+     m_worker = std::thread([this]()
+                            { workerLoop(); });
+ }
+@@ -28,14 +59,18 @@ GSThreadedBackend::~GSThreadedBackend()
+ 
+ void GSThreadedBackend::enqueue(Command &&command)
+ {
++    if (command.cost == 0u)
++        command.cost = kCommandBaseCost;
+     std::unique_lock<std::mutex> lock(m_mutex);
+-    if (m_queue.size() >= kMaxQueuedCommands)
++    if (m_queue.size() >= kMaxQueuedCommands || m_queuedCost - m_doneCost > kMaxQueuedCost)
+     {
+         m_idle.wait(lock, [this]()
+-                    { return m_queue.size() < kMaxQueuedCommands / 2u || m_stop; });
++                    { return (m_queue.size() < kMaxQueuedCommands / 2u && m_queuedCost - m_doneCost <= kMaxQueuedCost / 2u) || m_stop; });
+     }
+     const bool wasEmpty = m_queue.empty();
++    m_queuedCost += command.cost;
+     m_queue.push_back(std::move(command));
++    ++m_queuedCount;
+     lock.unlock();
+     if (wasEmpty)
+         m_workAvailable.notify_one();
+@@ -44,8 +79,9 @@ void GSThreadedBackend::enqueue(Command &&command)
+ void GSThreadedBackend::drain() const
+ {
+     std::unique_lock<std::mutex> lock(m_mutex);
+-    m_idle.wait(lock, [this]()
+-                { return (m_queue.empty() && !m_busy) || m_stop; });
++    const uint64_t target = m_queuedCount;
++    m_idle.wait(lock, [this, target]()
++                { return m_doneCount >= target || m_stop; });
+ }
+ 
+ void GSThreadedBackend::workerLoop()
+@@ -61,14 +97,54 @@ void GSThreadedBackend::workerLoop()
+         // Take the whole queue at once and run it without holding the lock.
+         std::deque<Command> work;
+         work.swap(m_queue);
+-        m_busy = true;
+         lock.unlock();
+         m_idle.notify_all(); // producers waiting for queue space
+ 
+-        for (Command &command : work)
+-            execute(command);
++        size_t index = 0;
++        size_t published = 0;
++        uint64_t executedCost = 0;
++        std::vector<const GSPrimitiveBatch *> batches;
++        while (index < work.size())
++        {
++            size_t next = index + 1u;
++            while (m_directCallers.load(std::memory_order_acquire) != 0u)
++                std::this_thread::yield();
++            {
++                std::lock_guard<std::mutex> exec(m_execMutex);
++                if (m_cpuInner && work[index].type == CommandType::Submit)
++                {
++                    // Hand runs of primitives over together so they can be drawn in parallel.
++                    batches.clear();
++                    next = index;
++                    while (next < work.size() && work[next].type == CommandType::Submit && batches.size() < 4096u)
++                        batches.push_back(&work[next++].batch);
++                    m_cpuInner->SubmitBatches(batches.data(), batches.size());
++                }
++                else
++                {
++                    execute(work[index]);
++                }
++            }
++            for (size_t i = index; i < next; ++i)
++                executedCost += work[i].cost;
++            index = next;
++            // Publish progress regularly so a drain or a waiting producer doesn't wait for the whole batch.
++            if (index - published >= 64u || executedCost >= 65536u)
++            {
++                {
++                    std::lock_guard<std::mutex> progress(m_mutex);
++                    m_doneCount += index - published;
++                    m_doneCost += executedCost;
++                }
++                published = index;
++                executedCost = 0;
++                m_idle.notify_all();
++            }
++        }
+ 
+         lock.lock();
++        m_doneCount += index - published;
++        m_doneCost += executedCost;
+         for (Command &command : work)
+         {
+             if (m_freeCommands.size() < 256u && command.bytes.capacity() != 0u)
+@@ -77,9 +153,7 @@ void GSThreadedBackend::workerLoop()
+                 m_freeCommands.push_back(std::move(command));
+             }
+         }
+-        m_busy = false;
+-        if (m_queue.empty())
+-            m_idle.notify_all();
++        m_idle.notify_all();
+     }
+ }
+ 
+@@ -114,12 +188,14 @@ void GSThreadedBackend::execute(Command &command)
+ void GSThreadedBackend::Initialize(uint8_t *vram, uint32_t vramSize)
+ {
+     drain();
++    DirectCall exec(*this);
+     m_inner->Initialize(vram, vramSize);
+ }
+ 
+ void GSThreadedBackend::Reset()
+ {
+     drain();
++    DirectCall exec(*this);
+     m_inner->Reset();
+ }
+ 
+@@ -128,6 +204,7 @@ void GSThreadedBackend::Submit(const GSPrimitiveBatch &batch)
+     Command command;
+     command.type = CommandType::Submit;
+     command.batch = batch;
++    command.cost = estimateDrawCost(batch);
+     enqueue(std::move(command));
+ }
+ 
+@@ -163,6 +240,7 @@ void GSThreadedBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+     }
+     command.type = CommandType::UploadImage;
+     command.bytes.assign(data, data + sizeBytes);
++    command.cost = kCommandBaseCost + sizeBytes / 4u;
+     enqueue(std::move(command));
+ }
+ 
+@@ -182,31 +260,39 @@ void GSThreadedBackend::TextureFlush()
+ 
+ void GSThreadedBackend::Sync(GSSyncReason reason)
+ {
+-    drain();
++    // Presentation is always followed by Present(), which drains; draining here too would make
++    // presentation wait for everything queued while it waited the first time.
++    if (reason != GSSyncReason::Presentation)
++        drain();
++    DirectCall exec(*this);
+     m_inner->Sync(reason);
+ }
+ 
+ PresentationFrame GSThreadedBackend::Present(const GSPresentationRequest &request)
+ {
+     drain();
++    DirectCall exec(*this);
+     return m_inner->Present(request);
+ }
+ 
+ bool GSThreadedBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+ {
+     drain();
++    DirectCall exec(*this);
+     return m_inner->ClearFramebuffer(context, rgba);
+ }
+ 
+ uint32_t GSThreadedBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ {
+     drain();
++    DirectCall exec(*this);
+     return m_inner->ConsumeLocalToHostBytes(dst, maxBytes);
+ }
+ 
+ uint32_t GSThreadedBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
+ {
+     drain();
++    DirectCall exec(*this);
+     return m_inner->ReadVram(psm, base, bw, x, y);
+ }
+ 
+@@ -226,11 +312,13 @@ void GSThreadedBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint
+ void GSThreadedBackend::SnapshotVram(std::vector<uint8_t> &out) const
+ {
+     drain();
++    DirectCall exec(*this);
+     m_inner->SnapshotVram(out);
+ }
+ 
+ GSTransferSnapshot GSThreadedBackend::GetTransferSnapshot() const
+ {
+     drain();
++    DirectCall exec(*this);
+     return m_inner->GetTransferSnapshot();
+ }
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.h b/ps2xRuntime/src/lib/gs/gs_threaded_backend.h
+index ac3d225..7816b9b 100644
+--- a/ps2xRuntime/src/lib/gs/gs_threaded_backend.h
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.h
+@@ -2,6 +2,9 @@
+ 
+ #include "runtime/gs/gs_backend.h"
+ 
++class GSCpuBackend;
++
++#include <atomic>
+ #include <condition_variable>
+ #include <cstdint>
+ #include <deque>
+@@ -19,8 +22,10 @@
+ // before it, then calls the wrapped backend directly, so results are identical to running the
+ // backend synchronously.
+ //
+-// All callers go through GS, which holds its state mutex around every backend call, so no new
+-// command can be queued while a caller waits for the queue to drain.
++// The EE thread queues commands while the host thread presents (presentation runs outside GS's
++// state mutex), so a drain waits only for the commands queued before it, never for the queue to
++// become empty: a producer that keeps queueing cannot starve presentation. Every call into the
++// wrapped backend, from the worker or from a caller, is serialised by m_execMutex.
+ class GSThreadedBackend final : public GSRasterBackend
+ {
+ public:
+@@ -70,10 +75,32 @@ private:
+         GSTransferCommand transfer{};
+         std::vector<uint8_t> bytes;
+         uint32_t psm = 0, base = 0, bw = 0, x = 0, y = 0, value = 0;
++        uint32_t cost = 0; // rough rasterisation cost, used to bound the work queued ahead
+     };
+ 
+     void enqueue(Command &&command);
+     void drain() const;
++    // Lock for a direct call into m_inner: the worker stands back while a direct caller waits,
++    // so a busy worker can't starve presentation or VRAM reads.
++    class DirectCall
++    {
++    public:
++        explicit DirectCall(const GSThreadedBackend &owner) : m_owner(owner)
++        {
++            m_owner.m_directCallers.fetch_add(1u, std::memory_order_acq_rel);
++            m_owner.m_execMutex.lock();
++        }
++        ~DirectCall()
++        {
++            m_owner.m_execMutex.unlock();
++            m_owner.m_directCallers.fetch_sub(1u, std::memory_order_acq_rel);
++        }
++        DirectCall(const DirectCall &) = delete;
++        DirectCall &operator=(const DirectCall &) = delete;
++
++    private:
++        const GSThreadedBackend &m_owner;
++    };
+     void workerLoop();
+     void execute(Command &command);
+ 
+@@ -83,7 +110,13 @@ private:
+     mutable std::condition_variable m_idle;
+     std::deque<Command> m_queue;
+     std::vector<Command> m_freeCommands; // reused to avoid reallocating vectors
+-    bool m_busy = false;
++    mutable std::mutex m_execMutex; // serialises all calls into m_inner
++    mutable std::atomic<uint32_t> m_directCallers{0}; // callers waiting to call m_inner directly
++    uint64_t m_queuedCount = 0;      // commands queued so far
++    uint64_t m_doneCount = 0;        // commands executed so far
++    uint64_t m_queuedCost = 0;       // total cost of the commands queued so far
++    uint64_t m_doneCost = 0;         // total cost of the commands executed so far
++    GSCpuBackend *m_cpuInner = nullptr; // set when the wrapped backend can draw in parallel
+     bool m_stop = false;
+     std::thread m_worker;
+ };

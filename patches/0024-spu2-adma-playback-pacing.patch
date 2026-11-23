@@ -1,0 +1,83 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 25e9b36..0c0fc0d 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -269,9 +269,26 @@ namespace ps2x::iop::detail
+         const uint32_t wordsPerBlock = std::max<uint32_t>(blockControl & 0xFFFFu, 1u);
+         const uint32_t blockCount = std::max<uint32_t>(blockControl >> 16u, 1u);
+         const uint64_t transferWords = static_cast<uint64_t>(wordsPerBlock) * blockCount;
++        uint64_t delayCycles = std::max<uint64_t>(transferWords * 2u, 64u);
++        // AutoDMA (ADMA) streams feed the SPU2's sound-data input, which takes 512 bytes per
++        // channel for every 256 stereo samples at 48 kHz, i.e. 192000 bytes per second.
++        // Completing such a transfer at that rate (rather than at memory speed) keeps
++        // streaming drivers such as CRI's ADX decoder running at playback speed instead of
++        // decoding thousands of blocks a second.
++        const uint32_t admaStatusAddress = secondCore ? 0x1F9005B0u : 0x1F9001B0u;
++        uint32_t admaWord = 0u;
++        if (const auto current = m_hardware.find(admaStatusAddress & ~3u); current != m_hardware.end())
++            admaWord = current->second;
++        const uint32_t admaStatus = (admaWord >> ((admaStatusAddress & 2u) * 8u)) & 0xFFFFu;
++        if (admaStatus != 0u)
++        {
++            constexpr uint64_t kIopClockHz = 36864000ull;
++            constexpr uint64_t kAdmaBytesPerSecond = 192000ull;
++            delayCycles = std::max<uint64_t>(delayCycles, transferWords * 4u * kIopClockHz / kAdmaBytesPerSecond);
++        }
+         m_dmaStart = DmaStart{
+             secondCore ? kDmaSpu1Irq : kDmaSpu0Irq,
+-            std::max<uint64_t>(transferWords * 2u, 64u),
++            delayCycles,
+         };
+     }
+ 
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index c92a27c..f72b760 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -1,3 +1,4 @@
++#include <unordered_map>
+ #include "iop_emulator.h"
+ #include "imports/iop_cdvd.h"
+ #include "core/iop_cpu.h"
+@@ -117,6 +118,7 @@ namespace ps2x::iop::detail
+         {
+             memory.reset();
+             kernel.reset();
++            threadInterruptControl.clear();
+             modules.clear();
+             imports.reset();
+             rpc.reset();
+@@ -500,10 +502,18 @@ namespace ps2x::iop::detail
+         }
+ 
+         // Not that good to use exception handling for control flow but will do for now
++        std::unordered_map<int, uint32_t> threadInterruptControl; // CpuSuspendIntr state per IOP thread
++
+         void servicePendingDmaInterrupts()
+         {
+             if (servicingDmaInterrupts || pendingDmaInterrupts.empty())
+                 return;
++            // A thread inside CpuSuspendIntr/CpuResumeIntr can't be interrupted on real
++            // hardware; hold completions until it enables interrupts again. (Completions
++            // used to be instant, so this never mattered; with SPU2 AutoDMA completing at
++            // playback speed they can land in the middle of a driver's critical section.)
++            if (memory.interruptControl() == 0u)
++                return;
+ 
+             servicingDmaInterrupts = true;
+ 
+@@ -595,7 +605,14 @@ namespace ps2x::iop::detail
+                         continue;
+                     }
+                     const uint64_t before = totalCycles;
++                    // CpuSuspendIntr state belongs to the thread (it lives in its COP0 status on
++                    // real hardware), so switch it with the thread.
++                    const int threadId = next->id;
++                    const auto savedControl = threadInterruptControl.find(threadId);
++                    memory.setInterruptControl(savedControl == threadInterruptControl.end() ? 1u : savedControl->second);
+                     runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
++                    threadInterruptControl[threadId] = memory.interruptControl();
++                    memory.setInterruptControl(1u);
+                     kernel.endTimeslice(*next, kThreadReturnSentinel);
+                     if (totalCycles == before)
+                         ++totalCycles;

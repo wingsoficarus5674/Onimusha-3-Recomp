@@ -152,6 +152,28 @@ keeping it constant means a new stub binding recompiles a few files instead of a
   (it corrupted SNDDRV's sound-bank state); IOP threads are no longer preempted by threads of the same
   priority (the IOP kernel doesn't do that); and a misaligned load/store with no exception handler is done at
   the aligned address instead of jumping into empty memory.
+- `0024-spu2-adma-playback-pacing.patch`: SPU2 AutoDMA (streamed music and movie audio) completes at playback
+  speed (48 kHz stereo, 192000 bytes/s) instead of instantly, so CRI's ADX decoder on the IOP runs a hundred
+  times a second instead of tens of thousands. Needed with it: a DMA completion interrupt is held while the
+  running IOP thread has interrupts suspended (`CpuSuspendIntr`), and that suspended state now belongs to the
+  thread instead of being global. Before this, a completion could land in the middle of a driver's critical
+  section.
+- `0025-gs-presentation-and-parallel-raster.patch`: fixes the "game stops after pressing Start" problem that
+  appeared once the IOP stopped slowing the game down. The menu was running, but presentation waited for the
+  rasteriser's queue to become *empty* while the game kept filling it, so the window never showed a new frame.
+  Presentation now waits only for the drawing queued before it, the game waits when it gets more than a few
+  frames of drawing ahead of the rasteriser (as the EE waits for a busy GS), and a caller that needs the
+  rasteriser (presentation, VRAM reads) gets it ahead of queued drawing. Runs of primitives that can't affect
+  each other through VRAM are split into 16-line bands and rasterised on several threads (one per core,
+  leaving one each for the game and the window; `PS2X_GS_THREADS=n` overrides the count). Bilinear texture
+  sampling skips texels whose weight is zero (every pixel of a 1:1 sprite), with identical output.
+- `0026-vu1-issue-time-register-writes.patch`: the VU1 interpreter writes VF/VI/ACC results when an
+  instruction issues instead of queueing them until the end of the pipeline. Every read of a register whose
+  result is still in flight already stalls until the result is ready, so no instruction can see the
+  difference (checked against the previous interpreter on 300 captured gameplay calls: identical VU memory,
+  registers and flags). Flags, Q, P and stores, which are read without interlocks, keep their pipelines.
+  With a few smaller changes (vectorised operand normalisation, fewer pipeline scans) VU1 is about 1.8x
+  faster again.
 
 ## Manual bindings
 
@@ -248,10 +270,11 @@ in this runtime a guest thread that never makes a syscall would never yield.
 17. ~~Black screen in gameplay: every vertex at 0,0~~ (patches 0018, 0019; libvu0 is no longer replaced by
     the runtime's HLE versions, the game's own routines are recompiled)
 18. NEW GAME starts and the 3D gameplay renders.
-19. Speed (patches 0021-0023): menus run at full speed; 3D gameplay is about 2x faster than before but not yet
-    full speed. Where the time goes now: the VU1 interpreter (3D geometry) and the IOP, which spends most of
-    its time in CRI's ADX audio decoder because SPU2 streaming DMA completes instantly instead of at playback
-    speed (pacing it correctly stops the game after the title screen, still under investigation).
+19. Speed (patches 0021-0026): menus run at full speed. 3D gameplay runs at about 3.5x the speed it had
+    before these patches (measured on a 2-core cloud machine: 5.7 -> 15-21 frames per second; a desktop CPU
+    with more and faster cores does better, and the rasteriser uses the extra cores). The IOP is now almost
+    idle; about three quarters of the game thread's time goes to the VU1 interpreter (3D geometry), which is
+    what still keeps gameplay below full speed on slower CPUs.
 
 ## Code overlays
 
