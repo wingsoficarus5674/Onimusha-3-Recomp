@@ -362,6 +362,15 @@ public static class O3Overlays
         uint[] coveredStarts = covered.Select(c => c[0]).ToArray();
         Dictionary<uint, uint> gapEnds = new Dictionary<uint, uint>();
         Func<uint, uint> textWord = a => U32(text, (int)(a - textBase));
+        Func<uint, bool> looksLikeFunctionStart = v =>
+        {
+            if (v < textBase + 4 || v + 12 > textBase + (uint)text.Length || textWord(v) == 0) return false;
+            for (uint k = 0; k < 3; k++) if ((textWord(v + 4 * k) & 0xFFFF8000u) == 0x27BD8000u) return true;
+            uint b = v - 4;
+            int pad = 0;
+            while (b > textBase && textWord(b) == 0 && pad < 4) { b -= 4; pad++; }
+            return b > textBase && textWord(b - 4) == 0x03E00008u; // b is the delay slot of "jr ra"
+        };
         Action<byte[]> scanPointers = img =>
         {
             for (int i = 0; i + 4 <= img.Length; i += 4)
@@ -371,13 +380,18 @@ public static class O3Overlays
                 int k = Array.BinarySearch(coveredStarts, v);
                 if (k < 0) k = ~k - 1;
                 if (k < 0) continue;
-                if (v < covered[k][1]) continue; // inside an analysed function
+                if (v < covered[k][1])
+                {
+                    // Inside an analysed function but not an entry point: an alternate entry, if it
+                    // looks like a function start. It covers the rest of that function.
+                    if (looksLikeFunctionStart(v)) gapEnds[v] = Math.Min(covered[k][1], v + 0x4000u);
+                    continue;
+                }
                 uint gapStart = covered[k][1];
                 uint gapEnd = (k + 1 < covered.Count) ? covered[k + 1][0] : tableEnd;
-                if (v - gapStart > 0x40 || textWord(v) == 0) continue;
-                bool padding = true;
-                for (uint a = gapStart; a < v; a += 4) { if (textWord(a) != 0) { padding = false; break; } }
-                if (!padding) continue;
+                bool padding = v - gapStart <= 0x40 && textWord(v) != 0;
+                for (uint a = gapStart; padding && a < v; a += 4) { if (textWord(a) != 0) padding = false; }
+                if (!padding && !looksLikeFunctionStart(v)) continue;
                 gapEnds[v] = Math.Min(gapEnd, v + 0x4000u);
             }
         };
