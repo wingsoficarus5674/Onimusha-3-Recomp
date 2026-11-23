@@ -62,9 +62,15 @@ Those labels point at data, not code. The heuristic fallback config gives about 
 2. `2_build_tools.bat` builds `ps2_recomp.exe` and `ps2_analyzer.exe`.
 3. `3_recompile.bat` turns the MIPS code into C++ in `output\`. The log goes to `recompile.log`. If there's no Ghidra config,
    it falls back to the analyzer config.
-4. `4_build_runtime.bat` copies `output\*.cpp` into `ps2xRuntime\src\runner` and `*.h` into `ps2xRuntime\include`, then builds `ps2EntryRunner.exe`.
+3b. `3b_recompile_overlays.bat` recompiles the game's code overlays (see "Code overlays" below): it extracts the
+   188 code modules from `game\IMAGE\IMAGE.AFS`, runs Ghidra on them (a few minutes), recompiles each one
+   with `ps2_recomp`, and writes the C++ to `output_overlays\`. Output is saved to
+   `build\3b_recompile_overlays_output.txt`.
+4. `4_build_runtime.bat` copies `output\*.cpp` into `ps2xRuntime\src\runner`, `output_overlays\*.cpp` into
+   `ps2xRuntime\src\runner_overlays` and `*.h` into `ps2xRuntime\include`, then builds `ps2EntryRunner.exe`.
    Compiling the generated C++ is heavy. Expect a long build and a lot of RAM use.
-5. `5_run.bat` boots `ps2EntryRunner.exe game\SLUS_206.94`.
+   Per-function trace logging (`ps2_log.txt`) is off; `4_build_runtime.bat trace` turns it on (very slow game).
+5. `5_run.bat` boots `ps2EntryRunner.exe game\SLUS_206.94`. Everything it prints is saved to `run_log.txt`.
 
 ## Patches to PS2Recomp
 
@@ -115,6 +121,14 @@ keeping it constant means a new stub binding recompiles a few files instead of a
   `std::thread` with the platform default stack (1 MB on Windows). On Windows it overflowed (exit code
   -1073741571 / 0xC00000FD) as soon as the sound and streaming threads started. The EE thread now gets a
   256 MB reserved stack, and the main thread 16 MB on MSVC.
+- `0015-recompiled-code-overlays.patch`: runtime support for code that is loaded at run time (see
+  "Code overlays"). Adds `ps2_overlays.h/.cpp`, a lookup in `hasFunction`/`lookupFunction`, and builds
+  `src/runner_overlays/*.cpp` outside the unity batches so overlay changes don't rebuild the main game code.
+- `0016-ipu-idec-still-images.patch`: software IPU IDEC (intra MPEG-1/2 macroblocks + colour conversion to
+  RGB32) and an Onimusha 3 override that decodes the game's `ipum` still images with it instead of the IPU.
+- `0017-dma-recv-and-spr-interleave.patch`: `sceDmaRecv`, `sceDmaRecvN` and `sceDmaRecvI` were unimplemented
+  (the runtime stopped with "Unimplemented PS2 stub called: sceDmaRecvN" after the warning screen); they now
+  program the channel like libdma. Scratchpad DMA also supports interleave mode (D_SQWC).
 
 ## Manual bindings
 
@@ -204,12 +218,34 @@ in this runtime a guest thread that never makes a syscall would never yield.
 10. ~~Memory card dialog ignoring input~~ (patch 0011, libpad2)
 11. ~~"Create a save file?" loop~~ (patch 0012)
 12. Boots through "Checking Memory Card", creates/loads the save, and shows the CAPCOM logo.
-13. **Current blocker: code overlays.** Most game code (title screen, menus, areas) lives in 517 compressed
-    Capcom "LINK" modules (`*.ldt` in `IMAGE.AFS`) that the game decompresses into RAM at 0x00D00000+ at
-    run time (the 198 empty ELF segments are their placeholders). Static recompilation only covers the main
-    ELF, so right after the logo the game calls 0x00D367E0 (overlay code) and its logic thread stops.
-    Next step: extract and decompress the `.ldt` modules, recompile each at its load address, and have the
-    runtime pick the recompiled module that is currently resident when it dispatches into that range.
+13. ~~Logic thread stopping right after the logo: code overlays~~ (patch 0015 + `3b_recompile_overlays.bat`)
+14. ~~Black screens instead of the middleware logos and warning~~ (patch 0016)
+15. ~~"Unimplemented PS2 stub called: sceDmaRecvN" after the warning screen~~ (patch 0017)
+16. Reaches the title screen ("PRESS START BUTTON") and the main menu.
+
+## Code overlays
+
+Most game code (title screen, menus, areas, enemies) isn't in SLUS_206.94. It lives in 517 Capcom "LINK"
+modules (`*.ldt` in `IMAGE.AFS`). Each is a list of entries compressed with CPK0 (LZSS, 4 KB window). Entries
+whose data starts with `MWo3` are code modules linked at a fixed address (0x00D00000, or 0x00D20000 for
+enemies), with the module name at offset 0x20 (`area108.bin` is the large shared title/game module). The game
+copies them into RAM unchanged (no relocation), and many different modules use the same addresses; the 198
+empty ELF segments are their placeholders.
+
+`3b_recompile_overlays.bat` recompiles the 188 unique code modules (about 1.7 MB of MIPS). Each module's C++
+lives in its own namespace and registers a table of its entry points with the runtime. Patch 0015 adds
+`ps2_overlays.h`: when the game branches to an address outside the main function table, the runtime checks
+which registered module is resident there (its first 0xC0 bytes in RAM) and runs that module's function.
+
+Overlay code also calls about 70 places in SLUS_206.94 that nothing in the main executable calls, so the
+main recompile has no entry for them (for example 0x0018F790). `overlays.ps1 -MainExtra` lists them from the
+modules' J/JAL targets and the main function table, `ps2_recomp` recompiles just those from SLUS_206.94, and
+they are registered as one extra module covering the main code (always resident), so the main build doesn't
+have to change.
+
+Still images (`ipum` entries: logos, the content warning, title backgrounds) are decoded by the IPU's IDEC
+command. Patch 0016 adds a software IDEC (`ps2_ipu_idec.cpp`) and uses it in place of the game's IPU strip
+decoder. FMV playback (Sofdec, also IPU) is not done yet; the opening movie is skipped as a black screen.
 
 Known gaps: no audio output yet (SPU2 not emulated), IPU-decoded still images and FMVs are not emulated.
 

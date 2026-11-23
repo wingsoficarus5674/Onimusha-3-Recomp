@@ -1,0 +1,145 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/DMA.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/DMA.cpp
+index b32e44a..cf940b4 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/DMA.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/DMA.cpp
+@@ -155,19 +155,52 @@ namespace ps2_stubs
+         setReturnU32(ctx, oldAddr);
+     }
+ 
++    // sceDmaRecv/RecvN/RecvI(chan, addr, size): start a transfer from the channel into memory
++    // (DIR=0) in chain, normal or interleave mode, the way libdma programs the channel
++    // registers. The channel's other registers (SADR for fromSPR, D_SQWC for interleave)
++    // are set by the game beforehand.
++    int32_t submitDmaRecv(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t mode)
++    {
++        if (!runtime)
++        {
++            return -1;
++        }
++        const uint32_t channelBase = resolveDmaChannelBase(rdram, getRegU32(ctx, 4));
++        if (channelBase == 0)
++        {
++            return -1;
++        }
++        const uint32_t addr = toDmaPhys(getRegU32(ctx, 5));
++        PS2Memory &mem = runtime->memory();
++        if (mode == 1u)
++        {
++            mem.writeIORegister(channelBase + 0x20u, 0u);
++            mem.writeIORegister(channelBase + 0x30u, addr);
++        }
++        else
++        {
++            mem.writeIORegister(channelBase + 0x20u, normalizeQwcFromArg(getRegU32(ctx, 6)) & 0xFFFFu);
++            mem.writeIORegister(channelBase + 0x10u, addr);
++        }
++        mem.writeIORegister(channelBase + 0x00u, 0x00000180u | (mode << 2)); // DIR=0, TIE=1, STR=1
++        mem.processPendingTransfers();
++        (void)mem.consumeCompletedDmacCauses();
++        return 0;
++    }
++
+     void sceDmaRecv(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        TODO_NAMED("sceDmaRecv", rdram, ctx, runtime);
++        setReturnS32(ctx, submitDmaRecv(rdram, ctx, runtime, 1u));
+     }
+ 
+     void sceDmaRecvI(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        TODO_NAMED("sceDmaRecvI", rdram, ctx, runtime);
++        setReturnS32(ctx, submitDmaRecv(rdram, ctx, runtime, 2u));
+     }
+ 
+     void sceDmaRecvN(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        TODO_NAMED("sceDmaRecvN", rdram, ctx, runtime);
++        setReturnS32(ctx, submitDmaRecv(rdram, ctx, runtime, 0u));
+     }
+ 
+     void sceDmaReset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index df8d81c..6fee51f 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1592,7 +1592,15 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
+         return false;
+ 
+     const uint32_t mode = (chcr >> 2u) & 0x3u;
+-    if (mode != 0u)
++    if (mode != 0u && mode != 2u)
++        return false;
++
++    // Interleave mode: TQWC qwords are transferred, then SQWC qwords of main memory skipped.
++    static constexpr uint32_t kDSqwc = 0x1000E030u;
++    const uint32_t sqwcReg = m_ioRegisters.count(kDSqwc) ? m_ioRegisters[kDSqwc] : 0u;
++    const uint32_t transferQwc = (mode == 2u) ? ((sqwcReg >> 16u) & 0xFFu) : 0u;
++    const uint32_t skipQwc = (mode == 2u) ? (sqwcReg & 0xFFu) : 0u;
++    if (mode == 2u && transferQwc == 0u)
+         return false;
+ 
+     const uint32_t qwc = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
+@@ -1610,33 +1618,49 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
+         return false;
+     }
+ 
+-    if (mainOffset > PS2_RAM_SIZE || byteCount > PS2_RAM_SIZE - mainOffset)
++    // Main-memory span touched: in interleave mode every TQWC block is followed by SQWC skipped qwords.
++    uint32_t mainSpan = byteCount;
++    if (mode == 2u && qwc != 0u)
++    {
++        const uint32_t blocks = (qwc + transferQwc - 1u) / transferQwc;
++        mainSpan = byteCount + (blocks - 1u) * skipQwc * 16u;
++    }
++    if (mainOffset > PS2_RAM_SIZE || mainSpan > PS2_RAM_SIZE - mainOffset)
+         return false;
+ 
+     const bool fromScratchpad = channelBase == kSprFromChannel;
+     uint32_t scratchOffset = originalSadr;
+     uint32_t bytesLeft = byteCount;
+-    uint32_t copied = 0u;
++    uint32_t mainCursor = mainOffset;
+     while (bytesLeft != 0u)
+     {
+-        const uint32_t scratchChunk = PS2_SCRATCHPAD_SIZE - scratchOffset;
+-        const uint32_t chunk = std::min(bytesLeft, scratchChunk);
+-        if (fromScratchpad)
++        const uint32_t blockBytes = (mode == 2u) ? std::min(bytesLeft, transferQwc * 16u) : bytesLeft;
++        uint32_t blockLeft = blockBytes;
++        while (blockLeft != 0u)
+         {
+-            std::memcpy(m_rdram + mainOffset + copied, m_scratchpad + scratchOffset, chunk);
+-            markModified(mainOffset + copied, chunk);
++            const uint32_t scratchChunk = PS2_SCRATCHPAD_SIZE - scratchOffset;
++            const uint32_t chunk = std::min(blockLeft, scratchChunk);
++            if (fromScratchpad)
++            {
++                std::memcpy(m_rdram + mainCursor, m_scratchpad + scratchOffset, chunk);
++                markModified(mainCursor, chunk);
++            }
++            else
++            {
++                std::memcpy(m_scratchpad + scratchOffset, m_rdram + mainCursor, chunk);
++            }
++            mainCursor += chunk;
++            blockLeft -= chunk;
++            scratchOffset = (scratchOffset + chunk) & (PS2_SCRATCHPAD_SIZE - 1u);
+         }
+-        else
++        bytesLeft -= blockBytes;
++        if (mode == 2u && bytesLeft != 0u)
+         {
+-            std::memcpy(m_scratchpad + scratchOffset, m_rdram + mainOffset + copied, chunk);
++            mainCursor += skipQwc * 16u;
+         }
+-
+-        copied += chunk;
+-        bytesLeft -= chunk;
+-        scratchOffset = (scratchOffset + chunk) & (PS2_SCRATCHPAD_SIZE - 1u);
+     }
+ 
+-    m_ioRegisters[channelBase + 0x10u] = (originalMadr + byteCount) & 0x7FFFFFF0u;
++    m_ioRegisters[channelBase + 0x10u] = (originalMadr + (mainCursor - mainOffset)) & 0x7FFFFFF0u;
+     m_ioRegisters[channelBase + 0x20u] = 0u;
+     m_ioRegisters[channelBase + 0x80u] = (originalSadr + byteCount) & 0x3FF0u;
+     completeDmacChannel(channelBase, fromScratchpad ? 8u : 9u);

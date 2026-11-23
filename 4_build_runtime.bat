@@ -18,6 +18,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File sync_generated.ps1 -Src outp
 if errorlevel 1 (echo Sync FAILED. & exit /b 1)
 powershell -NoProfile -ExecutionPolicy Bypass -File sync_generated.ps1 -Src output -Dst "%RT%\include" -Filter ps2_recompiled_functions.h
 if errorlevel 1 (echo Sync FAILED. & exit /b 1)
+rem Recompiled code overlays from 3b_recompile_overlays.bat
+if not exist "%RT%\src\runner_overlays" mkdir "%RT%\src\runner_overlays"
+if not exist output_overlays goto nooverlays
+powershell -NoProfile -ExecutionPolicy Bypass -File sync_generated.ps1 -Src output_overlays -Dst "%RT%\src\runner_overlays" -Filter *.cpp -Prune
+if errorlevel 1 (echo Sync FAILED. & exit /b 1)
+goto overlaysdone
+:nooverlays
+echo NOTE: output_overlays\ not found. Run 3b_recompile_overlays.bat first, otherwise the game
+echo       stops right after the CAPCOM logo.
+:overlaysdone
 rem ps2_recompiled_stubs.h only repeats declarations from ps2_recompiled_functions.h; a fixed copy
 rem means a new stub binding rebuilds a few files instead of all ~64,000
 powershell -NoProfile -ExecutionPolicy Bypass -File sync_generated.ps1 -Src patches -Dst "%RT%\include" -Filter ps2_recompiled_stubs.h

@@ -1,0 +1,198 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index bd66c55..4cc2e1b 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -3,6 +3,7 @@
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+ #include "game_overrides.h"
++#include "ps2_overlays.h"
+ #include "ps2_runtime_macros.h"
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/ee_scheduler.h"
+@@ -1220,7 +1221,11 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
+ bool PS2Runtime::hasFunction(uint32_t address) const
+ {
+     uint32_t slot = 0u;
+-    return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
++    if (generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr)
++    {
++        return true;
++    }
++    return ps2xFindOverlayFunction(const_cast<PS2Memory &>(m_memory).getRDRAM(), address) != nullptr;
+ }
+ 
+ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
+@@ -1256,6 +1261,11 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
+         }
+     }
+ 
++    if (RecompiledFunction overlayFn = ps2xFindOverlayFunction(m_memory.getRDRAM(), address))
++    {
++        return overlayFn;
++    }
++
+     std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
+               << " tableBase=0x" << g_ps2RecompiledFunctionTableBase
+               << " tableEnd=0x" << g_ps2RecompiledFunctionTableEnd
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 1ac6c0d..435ff0f 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -394,6 +394,7 @@ add_library(ps2_runtime STATIC
+     src/lib/vu/ps2_vu1_upper.cpp
+     src/lib/vu/ps2_vu1_lower.cpp
+     src/lib/games_database.cpp
++    src/lib/ps2_overlays.cpp
+ )
+ 
+ if(PS2X_ENABLE_RUNTIME_LOGS)
+@@ -462,6 +463,16 @@ else()
+     )
+ endif()
+ 
++# Recompiled code overlays (see include/ps2_overlays.h). Built outside the unity batches
++# so adding or changing overlays doesn't rebuild the main game code.
++file(GLOB RUNNER_OVERLAY_SRC_FILES CONFIGURE_DEPENDS
++    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner_overlays/*.cpp"
++)
++if(RUNNER_OVERLAY_SRC_FILES)
++    target_sources(ps2EntryRunner PRIVATE ${RUNNER_OVERLAY_SRC_FILES})
++    set_source_files_properties(${RUNNER_OVERLAY_SRC_FILES} PROPERTIES SKIP_UNITY_BUILD_INCLUSION TRUE)
++endif()
++
+ if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
+     set_target_properties(ps2EntryRunner PROPERTIES
+         UNITY_BUILD ON
+diff --git a/ps2xRuntime/include/ps2_overlays.h b/ps2xRuntime/include/ps2_overlays.h
+new file mode 100644
+index 0000000..8de79cb
+--- /dev/null
++++ b/ps2xRuntime/include/ps2_overlays.h
+@@ -0,0 +1,39 @@
++#pragma once
++
++// Recompiled code overlays.
++//
++// Some games load extra code into RAM at run time (Capcom's "LINK" modules, for
++// example), often several different modules at the same address over the course
++// of a game. Each module is recompiled separately and registers itself here. When
++// the runtime dispatches to an address outside the main function table, it asks
++// which registered module is resident there right now (by comparing the module's
++// signature bytes with RAM) and uses that module's recompiled function.
++
++#include <cstddef>
++#include <cstdint>
++
++#include "ps2_runtime.h"
++
++struct PS2OverlayFunction
++{
++    uint32_t address; // function entry or resume label
++    PS2Runtime::RecompiledFunction function;
++};
++
++struct PS2OverlayModule
++{
++    const char *name;
++    uint32_t loadAddress;                 // address the module image is linked and loaded at
++    uint32_t imageSize;                   // bytes covered by the module image
++    const uint8_t *signature;             // bytes expected at loadAddress while the module is resident
++    uint32_t signatureSize;
++    const PS2OverlayFunction *functions;  // sorted by address
++    size_t functionCount;
++};
++
++// Called from static initializers in generated overlay sources.
++void ps2xRegisterOverlayModule(const PS2OverlayModule *module);
++
++// Returns the recompiled function for address in the module currently resident
++// there, or nullptr.
++PS2Runtime::RecompiledFunction ps2xFindOverlayFunction(const uint8_t *rdram, uint32_t address);
+diff --git a/ps2xRuntime/src/lib/ps2_overlays.cpp b/ps2xRuntime/src/lib/ps2_overlays.cpp
+new file mode 100644
+index 0000000..8fc9893
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_overlays.cpp
+@@ -0,0 +1,81 @@
++#include "ps2_overlays.h"
++
++#include <algorithm>
++#include <cstring>
++#include <vector>
++
++namespace
++{
++    std::vector<const PS2OverlayModule *> &overlayRegistry()
++    {
++        static std::vector<const PS2OverlayModule *> modules;
++        return modules;
++    }
++
++    bool isResidentAt(const uint8_t *rdram, const PS2OverlayModule *module, uint32_t address)
++    {
++        if (address < module->loadAddress || address - module->loadAddress >= module->imageSize)
++        {
++            return false;
++        }
++        if (static_cast<uint64_t>(module->loadAddress) + module->signatureSize > PS2_RAM_SIZE)
++        {
++            return false;
++        }
++        return std::memcmp(rdram + module->loadAddress, module->signature, module->signatureSize) == 0;
++    }
++}
++
++void ps2xRegisterOverlayModule(const PS2OverlayModule *module)
++{
++    if (module != nullptr)
++    {
++        overlayRegistry().push_back(module);
++    }
++}
++
++PS2Runtime::RecompiledFunction ps2xFindOverlayFunction(const uint8_t *rdram, uint32_t address)
++{
++    const std::vector<const PS2OverlayModule *> &modules = overlayRegistry();
++    if (rdram == nullptr || modules.empty())
++    {
++        return nullptr;
++    }
++
++    address &= 0x1FFFFFFFu;
++
++    // Most lookups hit the module that answered last time.
++    thread_local const PS2OverlayModule *s_lastModule = nullptr;
++    const PS2OverlayModule *module = nullptr;
++    if (s_lastModule != nullptr && isResidentAt(rdram, s_lastModule, address))
++    {
++        module = s_lastModule;
++    }
++    else
++    {
++        for (const PS2OverlayModule *candidate : modules)
++        {
++            if (isResidentAt(rdram, candidate, address))
++            {
++                module = candidate;
++                break;
++            }
++        }
++    }
++    if (module == nullptr)
++    {
++        return nullptr;
++    }
++    s_lastModule = module;
++
++    const PS2OverlayFunction *begin = module->functions;
++    const PS2OverlayFunction *end = module->functions + module->functionCount;
++    const PS2OverlayFunction *it = std::lower_bound(begin, end, address,
++                                                    [](const PS2OverlayFunction &entry, uint32_t value)
++                                                    { return entry.address < value; });
++    if (it == end || it->address != address)
++    {
++        return nullptr;
++    }
++    return it->function;
++}

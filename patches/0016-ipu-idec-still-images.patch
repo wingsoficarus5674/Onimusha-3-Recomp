@@ -1,0 +1,622 @@
+diff --git a/ps2xRuntime/src/lib/game_overrides.cpp b/ps2xRuntime/src/lib/game_overrides.cpp
+index 4bc854e..ad0aa9a 100644
+--- a/ps2xRuntime/src/lib/game_overrides.cpp
++++ b/ps2xRuntime/src/lib/game_overrides.cpp
+@@ -1,10 +1,12 @@
+ #include "game_overrides.h"
++#include "ps2_ipu_idec.h"
+ #include "ps2_runtime.h"
+ #include "ps2_runtime_calls.h"
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+ #include "ps2_log.h"
+ #include <algorithm>
++#include <cstring>
+ #include <cctype>
+ #include <filesystem>
+ #include <iostream>
+@@ -199,12 +201,79 @@ namespace ps2_stubs
+ 
+ namespace
+ {
+-    // The IPU (MPEG decoder) is not emulated. Skip work that would wait on it.
+-    void skipIpuWork(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    uint8_t *guestPtr(uint8_t *rdram, uint32_t address, uint32_t bytes)
++    {
++        address &= 0x1FFFFFFFu;
++        if (address >= PS2_RAM_SIZE || bytes > PS2_RAM_SIZE - address)
++        {
++            return nullptr;
++        }
++        return rdram + address;
++    }
++
++    // Onimusha 3 FUN_0028CE60(image, stream, size, const short p[4] = {x, y, mbColumns, mbRows}):
++    // decodes one strip of an "ipum" still image with the IPU's IDEC (thresholds 0/0x1FF) and
++    // stores the 16x16 RGB32 macroblocks into the raster image whose address is kept at gp-0x5B54. The IPU is not emulated, so this does the
++    // decode in software (see ps2_ipu_idec.h).
++    void onimusha3DecodeIpuStrip(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        (void)rdram;
+-        (void)ctx;
+         (void)runtime;
++        const uint32_t image = getRegU32(ctx, 4);
++        const uint32_t stream = getRegU32(ctx, 5);
++        const uint32_t size = getRegU32(ctx, 6);
++        const uint32_t params = getRegU32(ctx, 7);
++        const uint32_t gp = getRegU32(ctx, 28);
++
++        const uint8_t *widthMbPtr = guestPtr(rdram, image + 0x4Cu, 1u);
++        const uint8_t *paramPtr = guestPtr(rdram, params, 8u);
++        const uint8_t *basePtr = guestPtr(rdram, gp - 0x5B54u, 4u);
++        const uint8_t *bits = guestPtr(rdram, stream, size);
++        if (!widthMbPtr || !paramPtr || !basePtr || !bits || size < 2u)
++        {
++            return;
++        }
++        int16_t p[4];
++        std::memcpy(p, paramPtr, sizeof(p));
++        uint32_t base = 0;
++        std::memcpy(&base, basePtr, sizeof(base));
++        const uint32_t widthMb = *widthMbPtr;
++        const uint32_t columns = static_cast<uint16_t>(p[2]);
++        const uint32_t rows = static_cast<uint16_t>(p[3]);
++        if (columns == 0u || rows == 0u)
++        {
++            return;
++        }
++        const uint32_t origin = base + static_cast<uint32_t>(p[0] + static_cast<int32_t>(widthMb) * 16 * p[1]) * 4u;
++
++        const uint8_t flags = bits[0]; // IPU_CTRL bits 16-23 for this stream; bit 2 is IDEC.DTD
++        IpuIdecParams ipu;
++        ipu.intraDcPrecision = flags & 3u;
++        ipu.dctTypeDecode = (flags & 0x04u) != 0;
++        ipu.alternateScan = (flags & 0x10u) != 0;
++        ipu.intraVlcFormat = (flags & 0x20u) != 0;
++        ipu.nonLinearQScale = (flags & 0x40u) != 0;
++        ipu.mpeg1 = (flags & 0x80u) != 0;
++        ipu.quantiserScaleCode = 1;
++        ipu.threshold0 = 0;
++        ipu.threshold1 = 0x1FF;
++        ipuIdecDecode(bits + 1, size - 1u, ipu, static_cast<size_t>(columns) * rows,
++                      [&](size_t index, const uint8_t *rgba)
++                      {
++                          // The game receives each macroblock through an interleaved fromSPR DMA
++                          // (4 qwords transferred, (widthMb - 1) * 4 skipped), so its 16 lines land in
++                          // a raster image widthMb * 64 bytes per line wide.
++                          const uint32_t row = static_cast<uint32_t>(index / columns);
++                          const uint32_t column = static_cast<uint32_t>(index % columns);
++                          const uint32_t lineBytes = widthMb * 0x40u;
++                          const uint32_t dst = origin + row * widthMb * 0x400u + column * 0x40u;
++                          for (uint32_t line = 0; line < 16u; ++line)
++                          {
++                              if (uint8_t *out = guestPtr(rdram, dst + line * lineBytes, 0x40u))
++                              {
++                                  std::memcpy(out, rgba + line * 0x40u, 0x40u);
++                              }
++                          }
++                      });
+     }
+ 
+     // Onimusha 3: Demon Siege (USA), SLUS_206.94.
+@@ -219,9 +288,8 @@ namespace
+         runtime.replaceFunction(0x00159050u, &getProfile);   // analog/pressure capability query
+         runtime.replaceFunction(0x001593C8u, &read);         // scePad2Read
+ 
+-        // IPU still-image decode (one macroblock strip per call) for full-screen
+-        // backgrounds. Without an IPU the image is left blank instead of hanging.
+-        runtime.replaceFunction(0x0028CE60u, &skipIpuWork);
++        // IPU still-image decode (one macroblock strip per call) for full-screen images.
++        runtime.replaceFunction(0x0028CE60u, &onimusha3DecodeIpuStrip);
+     }
+ }
+ 
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 435ff0f..8f4cc25 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -395,6 +395,7 @@ add_library(ps2_runtime STATIC
+     src/lib/vu/ps2_vu1_lower.cpp
+     src/lib/games_database.cpp
+     src/lib/ps2_overlays.cpp
++    src/lib/ps2_ipu_idec.cpp
+ )
+ 
+ if(PS2X_ENABLE_RUNTIME_LOGS)
+diff --git a/ps2xRuntime/include/ps2_ipu_idec.h b/ps2xRuntime/include/ps2_ipu_idec.h
+new file mode 100644
+index 0000000..83f568d
+--- /dev/null
++++ b/ps2xRuntime/include/ps2_ipu_idec.h
+@@ -0,0 +1,29 @@
++#pragma once
++
++// Software IPU IDEC: decodes intra-coded MPEG-1/2 macroblocks (the bitstream the IPU's
++// IDEC command consumes) and converts them to 16x16 RGB32 macroblocks like the IPU's CSC.
++// Used to stand in for IPU still-image decoders, since the IPU itself is not emulated.
++
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++
++struct IpuIdecParams
++{
++    uint8_t intraDcPrecision = 0;  // IPU_CTRL.IDP
++    bool alternateScan = false;    // IPU_CTRL.AS
++    bool intraVlcFormat = false;   // IPU_CTRL.IVF (table B-15 instead of B-14)
++    bool nonLinearQScale = false;  // IPU_CTRL.QST
++    bool mpeg1 = false;            // IPU_CTRL.MP1
++    bool dctTypeDecode = false;    // IDEC.DTD
++    uint8_t quantiserScaleCode = 1;// IDEC.QSC
++    uint16_t threshold0 = 0;       // SETTH TH0 (transparent below)
++    uint16_t threshold1 = 0;       // SETTH TH1 (semi-transparent below)
++    const uint8_t *intraMatrix = nullptr; // 64 entries in raster order; nullptr = MPEG default
++};
++
++// Decodes up to maxMacroblocks macroblocks from data and calls out(index, rgba) for each one,
++// where rgba holds 16x16 pixels of R,G,B,A in raster order (1024 bytes).
++// Stops early at a start code or on a bitstream error. Returns the number decoded.
++size_t ipuIdecDecode(const uint8_t *data, size_t size, const IpuIdecParams &params, size_t maxMacroblocks,
++                     const std::function<void(size_t, const uint8_t *)> &out);
+diff --git a/ps2xRuntime/src/lib/ps2_ipu_idec.cpp b/ps2xRuntime/src/lib/ps2_ipu_idec.cpp
+new file mode 100644
+index 0000000..1e545ee
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_ipu_idec.cpp
+@@ -0,0 +1,456 @@
++#include "ps2_ipu_idec.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include <vector>
++
++namespace
++{
++    struct VlcEntry
++    {
++        uint32_t code;
++        uint8_t length;
++        uint8_t run;
++        uint8_t level;
++    };
++
++    struct VlcTable
++    {
++        std::vector<VlcEntry> entries;
++    };
++
++    VlcTable buildTable(const char *const *codes, const uint8_t (*values)[2], size_t count)
++    {
++        VlcTable table;
++        for (size_t i = 0; i < count; ++i)
++        {
++            const char *code = codes[i];
++            VlcEntry e{0u, 0u, values[i][0], values[i][1]};
++            for (const char *p = code; *p; ++p)
++            {
++                e.code = (e.code << 1) | static_cast<uint32_t>(*p - '0');
++                ++e.length;
++            }
++            table.entries.push_back(e);
++        }
++        std::sort(table.entries.begin(), table.entries.end(),
++                  [](const VlcEntry &a, const VlcEntry &b)
++                  { return a.length < b.length; });
++        return table;
++    }
++
++    // dct_dc_size_luminance / chrominance (Tables B-12, B-13): value = size.
++    const char *const kDcLumaCodes[] = {"100", "00", "01", "101", "110", "1110", "11110", "111110", "1111110",
++                                        "11111110", "111111110", "111111111"};
++    const char *const kDcChromaCodes[] = {"00", "01", "10", "110", "1110", "11110", "111110", "1111110",
++                                          "11111110", "111111110", "1111111110", "1111111111"};
++
++    // Run/level codes shared by tables B-14 and B-15 (codes of 12 bits and longer differ only where listed).
++    const char *const kLongCodes[] = {
++        "000000011101", "000000011000", "000000010011", "000000010000", "000000011011", "000000010100",
++        "000000011100", "000000010010", "000000011110", "000000010101", "000000010001", "000000011111",
++        "000000011010", "000000011001", "000000010111", "000000010110",
++        "0000000011010", "0000000011001", "0000000011000", "0000000010111", "0000000010110", "0000000010101",
++        "0000000010100", "0000000010011", "0000000010010", "0000000010001", "0000000010000", "0000000011111",
++        "0000000011110", "0000000011101", "0000000011100", "0000000011011",
++        "00000000011111", "00000000011110", "00000000011101", "00000000011100", "00000000011011", "00000000011010",
++        "00000000011001", "00000000011000", "00000000010111", "00000000010110", "00000000010101", "00000000010100",
++        "00000000010011", "00000000010010", "00000000010001", "00000000010000",
++        "000000000011000", "000000000010111", "000000000010110", "000000000010101", "000000000010100",
++        "000000000010011", "000000000010010", "000000000010001", "000000000010000", "000000000011111",
++        "000000000011110", "000000000011101", "000000000011100", "000000000011011", "000000000011010",
++        "000000000011001",
++        "0000000000010011", "0000000000010010", "0000000000010001", "0000000000010000", "0000000000010100",
++        "0000000000011010", "0000000000011001", "0000000000011000", "0000000000010111", "0000000000010110",
++        "0000000000010101", "0000000000011111", "0000000000011110", "0000000000011101", "0000000000011100",
++        "0000000000011011"};
++    const uint8_t kLongValues[][2] = {
++        {0, 8}, {0, 9}, {0, 10}, {0, 11}, {1, 5}, {2, 4}, {3, 3}, {4, 3}, {6, 2}, {7, 2}, {8, 2}, {17, 1},
++        {18, 1}, {19, 1}, {20, 1}, {21, 1},
++        {0, 12}, {0, 13}, {0, 14}, {0, 15}, {1, 6}, {1, 7}, {2, 5}, {3, 4}, {5, 3}, {9, 2}, {10, 2}, {22, 1},
++        {23, 1}, {24, 1}, {25, 1}, {26, 1},
++        {0, 16}, {0, 17}, {0, 18}, {0, 19}, {0, 20}, {0, 21}, {0, 22}, {0, 23}, {0, 24}, {0, 25}, {0, 26},
++        {0, 27}, {0, 28}, {0, 29}, {0, 30}, {0, 31},
++        {0, 32}, {0, 33}, {0, 34}, {0, 35}, {0, 36}, {0, 37}, {0, 38}, {0, 39}, {0, 40}, {1, 8}, {1, 9},
++        {1, 10}, {1, 11}, {1, 12}, {1, 13}, {1, 14},
++        {1, 15}, {1, 16}, {1, 17}, {1, 18}, {6, 3}, {11, 2}, {12, 2}, {13, 2}, {14, 2}, {15, 2}, {16, 2},
++        {27, 1}, {28, 1}, {29, 1}, {30, 1}, {31, 1}};
++
++    // Table B-14, codes shorter than 12 bits (EOB "10" and escape "000001" handled separately).
++    const char *const kB14ShortCodes[] = {"11", "011", "0100", "0101", "00101", "00111", "00110", "000110",
++                                          "000111", "000101", "000100", "0000110", "0000100", "0000111",
++                                          "0000101", "00100110", "00100001", "00100101", "00100100",
++                                          "00100111", "00100011", "00100010", "00100000", "0000001010",
++                                          "0000001100", "0000001011", "0000001111", "0000001001",
++                                          "0000001110", "0000001101", "0000001000"};
++    const uint8_t kB14ShortValues[][2] = {{0, 1}, {1, 1}, {0, 2}, {2, 1}, {0, 3}, {3, 1}, {4, 1}, {1, 2},
++                                          {5, 1}, {6, 1}, {7, 1}, {0, 4}, {2, 2}, {8, 1}, {9, 1}, {0, 5},
++                                          {0, 6}, {1, 3}, {3, 2}, {10, 1}, {11, 1}, {12, 1}, {13, 1}, {0, 7},
++                                          {1, 4}, {2, 3}, {4, 2}, {5, 2}, {14, 1}, {15, 1}, {16, 1}};
++
++    // Table B-15 (intra_vlc_format = 1), codes that differ from B-14 (EOB is "0110").
++    const char *const kB15ShortCodes[] = {"10", "010", "110", "00101", "0111", "00111", "000110", "00110",
++                                          "000111", "0000110", "0000100", "11100", "0000111", "0000101",
++                                          "1111000", "11101", "000101", "1111001", "00100110", "1111010",
++                                          "00100001", "00100101", "00100100", "000100", "00100111",
++                                          "11111100", "11111101", "000000100", "000000101", "000000111",
++                                          "0000001101", "1111011", "1111100", "00100011", "00100010",
++                                          "00100000", "0000001100", "11111010", "11111011", "11111110",
++                                          "11111111"};
++    const uint8_t kB15ShortValues[][2] = {{0, 1}, {1, 1}, {0, 2}, {2, 1}, {0, 3}, {3, 1}, {4, 1}, {1, 2},
++                                          {5, 1}, {6, 1}, {7, 1}, {0, 4}, {2, 2}, {8, 1}, {9, 1}, {0, 5},
++                                          {0, 6}, {1, 3}, {3, 2}, {10, 1}, {11, 1}, {12, 1}, {13, 1}, {0, 7},
++                                          {1, 4}, {2, 3}, {4, 2}, {5, 2}, {14, 1}, {15, 1}, {16, 1}, {0, 8},
++                                          {0, 9}, {0, 10}, {0, 11}, {1, 5}, {2, 4}, {0, 12}, {0, 13}, {0, 14},
++                                          {0, 15}};
++
++    const uint8_t kZigZag[64] = {0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
++                                 12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
++                                 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
++                                 58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63};
++    const uint8_t kAlternate[64] = {0, 8, 16, 24, 1, 9, 2, 10, 17, 25, 32, 40, 48, 56, 57, 49,
++                                    41, 33, 26, 18, 3, 11, 4, 12, 19, 27, 34, 42, 50, 58, 35, 43,
++                                    51, 59, 20, 28, 5, 13, 6, 14, 21, 29, 36, 44, 52, 60, 37, 45,
++                                    53, 61, 22, 30, 7, 15, 23, 31, 38, 46, 54, 62, 39, 47, 55, 63};
++    const uint8_t kDefaultIntraMatrix[64] = {8, 16, 19, 22, 26, 27, 29, 34, 16, 16, 22, 24, 27, 29, 34, 37,
++                                             19, 22, 26, 27, 29, 34, 34, 38, 22, 22, 26, 27, 29, 34, 37, 40,
++                                             22, 26, 27, 29, 32, 35, 40, 48, 26, 27, 29, 32, 35, 40, 48, 58,
++                                             26, 27, 29, 34, 38, 46, 56, 69, 27, 29, 35, 38, 46, 56, 69, 83};
++    const uint8_t kNonLinearQScale[32] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 18, 20, 22,
++                                          24, 28, 32, 36, 40, 44, 48, 52, 56, 64, 72, 80, 88, 96, 104, 112};
++
++    struct Tables
++    {
++        VlcTable dcLuma;
++        VlcTable dcChroma;
++        VlcTable b14;
++        VlcTable b15;
++        float idct[8][8];
++
++        Tables()
++        {
++            static const uint8_t dcValues[12][2] = {{0, 0}, {0, 1}, {0, 2}, {0, 3}, {0, 4}, {0, 5},
++                                                     {0, 6}, {0, 7}, {0, 8}, {0, 9}, {0, 10}, {0, 11}};
++            dcLuma = buildTable(kDcLumaCodes, dcValues, 12);
++            dcChroma = buildTable(kDcChromaCodes, dcValues, 12);
++
++            b14 = buildTable(kB14ShortCodes, kB14ShortValues, sizeof(kB14ShortCodes) / sizeof(kB14ShortCodes[0]));
++            VlcTable longCodes = buildTable(kLongCodes, kLongValues, sizeof(kLongCodes) / sizeof(kLongCodes[0]));
++            b14.entries.insert(b14.entries.end(), longCodes.entries.begin(), longCodes.entries.end());
++
++            b15 = buildTable(kB15ShortCodes, kB15ShortValues, sizeof(kB15ShortCodes) / sizeof(kB15ShortCodes[0]));
++            for (const VlcEntry &e : longCodes.entries)
++            {
++                // B-15 moved these values to shorter codes; their 12-bit B-14 codes are unused.
++                const bool moved = (e.length == 12 && ((e.run == 0 && e.level >= 8 && e.level <= 11) ||
++                                                       (e.run == 1 && e.level == 5) || (e.run == 2 && e.level == 4))) ||
++                                   (e.length == 13 && e.run == 0 && e.level >= 12 && e.level <= 15);
++                if (!moved)
++                {
++                    b15.entries.push_back(e);
++                }
++            }
++
++            for (int u = 0; u < 8; ++u)
++            {
++                for (int x = 0; x < 8; ++x)
++                {
++                    const double scale = (u == 0) ? std::sqrt(0.125) : 0.5;
++                    idct[u][x] = static_cast<float>(scale * std::cos((2 * x + 1) * u * 3.14159265358979323846 / 16.0));
++                }
++            }
++        }
++    };
++
++    const Tables &tables()
++    {
++        static const Tables t;
++        return t;
++    }
++
++    class BitReader
++    {
++    public:
++        BitReader(const uint8_t *data, size_t size) : m_data(data), m_size(size) {}
++
++        uint32_t peek(unsigned n) const
++        {
++            uint32_t v = 0;
++            for (unsigned i = 0; i < n; ++i)
++            {
++                const size_t bit = m_pos + i;
++                const size_t byte = bit >> 3;
++                const uint32_t b = (byte < m_size) ? ((m_data[byte] >> (7u - (bit & 7u))) & 1u) : 0u;
++                v = (v << 1) | b;
++            }
++            return v;
++        }
++        uint32_t get(unsigned n)
++        {
++            const uint32_t v = peek(n);
++            m_pos += n;
++            return v;
++        }
++        void skip(unsigned n) { m_pos += n; }
++        bool exhausted() const { return (m_pos >> 3) >= m_size; }
++
++    private:
++        const uint8_t *m_data;
++        size_t m_size;
++        size_t m_pos = 0;
++    };
++
++    const VlcEntry *decodeVlc(BitReader &bits, const VlcTable &table)
++    {
++        for (const VlcEntry &e : table.entries)
++        {
++            if (bits.peek(e.length) == e.code)
++            {
++                bits.skip(e.length);
++                return &e;
++            }
++        }
++        return nullptr;
++    }
++
++    void inverseDct(const int32_t in[64], float out[64])
++    {
++        const Tables &t = tables();
++        float tmp[64];
++        for (int v = 0; v < 8; ++v)
++        {
++            for (int x = 0; x < 8; ++x)
++            {
++                float s = 0.0f;
++                for (int u = 0; u < 8; ++u)
++                {
++                    s += t.idct[u][x] * static_cast<float>(in[v * 8 + u]);
++                }
++                tmp[v * 8 + x] = s;
++            }
++        }
++        for (int y = 0; y < 8; ++y)
++        {
++            for (int x = 0; x < 8; ++x)
++            {
++                float s = 0.0f;
++                for (int v = 0; v < 8; ++v)
++                {
++                    s += t.idct[v][y] * tmp[v * 8 + x];
++                }
++                out[y * 8 + x] = s;
++            }
++        }
++    }
++
++    uint8_t clampByte(float v)
++    {
++        const int i = static_cast<int>(std::lround(v));
++        return static_cast<uint8_t>(i < 0 ? 0 : (i > 255 ? 255 : i));
++    }
++}
++
++size_t ipuIdecDecode(const uint8_t *data, size_t size, const IpuIdecParams &params, size_t maxMacroblocks,
++                     const std::function<void(size_t, const uint8_t *)> &out)
++{
++    const Tables &t = tables();
++    if (data == nullptr || size == 0 || maxMacroblocks == 0)
++    {
++        return 0;
++    }
++
++    BitReader bits(data, size);
++    const uint8_t *scan = params.alternateScan ? kAlternate : kZigZag;
++    const uint8_t *matrix = params.intraMatrix ? params.intraMatrix : kDefaultIntraMatrix;
++    const VlcTable &acTable = params.intraVlcFormat ? t.b15 : t.b14;
++    const unsigned eobLength = params.intraVlcFormat ? 4u : 2u;
++    const uint32_t eobCode = params.intraVlcFormat ? 0x6u : 0x2u;
++    const int dcReset = 128 << params.intraDcPrecision;
++    const int dcMult = 8 >> params.intraDcPrecision;
++
++    int dcPred[3] = {dcReset, dcReset, dcReset};
++    unsigned qCode = params.quantiserScaleCode;
++    size_t decoded = 0;
++    float blocks[6][64];
++    uint8_t rgba[16 * 16 * 4];
++
++    for (; decoded < maxMacroblocks; ++decoded)
++    {
++        if (decoded > 0)
++        {
++            if (bits.peek(23) == 0u || bits.exhausted())
++            {
++                break; // start code / end of data
++            }
++            unsigned increment = 0;
++            while (bits.peek(11) == 0x8u)
++            {
++                bits.skip(11);
++                increment += 33;
++            }
++            if (bits.peek(1) != 1u)
++            {
++                break; // stills only use an increment of 1
++            }
++            bits.skip(1);
++            increment += 1;
++            if (increment != 1)
++            {
++                dcPred[0] = dcPred[1] = dcPred[2] = dcReset;
++            }
++        }
++
++        bool quant = false;
++        if (bits.get(1) == 1u)
++        {
++            quant = false;
++        }
++        else if (bits.get(1) == 1u)
++        {
++            quant = true;
++        }
++        else
++        {
++            break; // not an intra macroblock
++        }
++        const bool fieldDct = params.dctTypeDecode ? (bits.get(1) != 0u) : false;
++        if (quant)
++        {
++            qCode = bits.get(5);
++        }
++        const int qScale = params.nonLinearQScale ? kNonLinearQScale[qCode & 31u] : static_cast<int>(qCode) * 2;
++
++        bool ok = true;
++        for (int b = 0; b < 6 && ok; ++b)
++        {
++            const int cc = (b < 4) ? 0 : b - 3;
++            const VlcEntry *dc = decodeVlc(bits, cc == 0 ? t.dcLuma : t.dcChroma);
++            if (dc == nullptr)
++            {
++                ok = false;
++                break;
++            }
++            const unsigned dcSize = dc->level;
++            int diff = 0;
++            if (dcSize != 0)
++            {
++                const int v = static_cast<int>(bits.get(dcSize));
++                diff = (v >= (1 << (dcSize - 1))) ? v : v - (1 << dcSize) + 1;
++            }
++            dcPred[cc] += diff;
++
++            int32_t coef[64];
++            std::memset(coef, 0, sizeof(coef));
++            coef[0] = dcPred[cc] * dcMult;
++            int sum = coef[0];
++            int index = 0;
++            for (;;)
++            {
++                if (bits.peek(eobLength) == eobCode)
++                {
++                    bits.skip(eobLength);
++                    break;
++                }
++                int run = 0;
++                int level = 0;
++                if (bits.peek(6) == 0x1u)
++                {
++                    bits.skip(6);
++                    run = static_cast<int>(bits.get(6));
++                    if (params.mpeg1)
++                    {
++                        level = static_cast<int>(bits.get(8));
++                        if (level == 0)
++                            level = static_cast<int>(bits.get(8));
++                        else if (level == 128)
++                            level = static_cast<int>(bits.get(8)) - 256;
++                        else if (level > 128)
++                            level -= 256;
++                    }
++                    else
++                    {
++                        level = static_cast<int>(bits.get(12));
++                        if (level & 0x800)
++                            level -= 0x1000;
++                    }
++                }
++                else
++                {
++                    const VlcEntry *e = decodeVlc(bits, acTable);
++                    if (e == nullptr)
++                    {
++                        ok = false;
++                        break;
++                    }
++                    run = e->run;
++                    level = bits.get(1) ? -static_cast<int>(e->level) : static_cast<int>(e->level);
++                }
++                index += run + 1;
++                if (index > 63)
++                {
++                    ok = false;
++                    break;
++                }
++                const int pos = scan[index];
++                const int magnitude = (std::abs(level) * matrix[pos] * qScale) / 16;
++                int value = (level < 0) ? -magnitude : magnitude;
++                if (params.mpeg1 && value != 0 && (value & 1) == 0)
++                {
++                    value += (value > 0) ? -1 : 1; // MPEG-1 oddification
++                }
++                value = std::max(-2048, std::min(2047, value));
++                coef[pos] = value;
++                sum += value;
++            }
++            if (!ok)
++            {
++                break;
++            }
++            if (!params.mpeg1 && (sum & 1) == 0)
++            {
++                coef[63] ^= 1; // MPEG-2 mismatch control
++            }
++            inverseDct(coef, blocks[b]);
++        }
++        if (!ok)
++        {
++            break;
++        }
++
++        for (int y = 0; y < 16; ++y)
++        {
++            for (int x = 0; x < 16; ++x)
++            {
++                int by = y & 7;
++                int blockIndex = ((y >> 3) & 1) * 2 + (x >> 3);
++                if (fieldDct)
++                {
++                    blockIndex = (y & 1) * 2 + (x >> 3);
++                    by = y >> 1;
++                }
++                const float luma = blocks[blockIndex][by * 8 + (x & 7)];
++                const float cb = blocks[4][(y >> 1) * 8 + (x >> 1)] - 128.0f;
++                const float cr = blocks[5][(y >> 1) * 8 + (x >> 1)] - 128.0f;
++                const float l = 1.164f * (luma - 16.0f);
++                uint8_t *p = rgba + (y * 16 + x) * 4;
++                p[0] = clampByte(l + 1.596f * cr);
++                p[1] = clampByte(l - 0.392f * cb - 0.813f * cr);
++                p[2] = clampByte(l + 2.017f * cb);
++                p[3] = 0x80;
++                if (params.threshold0 > 0 && p[0] < params.threshold0 && p[1] < params.threshold0 &&
++                    p[2] < params.threshold0)
++                {
++                    p[0] = p[1] = p[2] = p[3] = 0;
++                }
++                else if (params.threshold1 > 0 && p[0] < params.threshold1 && p[1] < params.threshold1 &&
++                         p[2] < params.threshold1)
++                {
++                    p[3] = 0x40;
++                }
++            }
++        }
++        out(decoded, rgba);
++    }
++    return decoded;
++}
