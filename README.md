@@ -111,6 +111,10 @@ keeping it constant means a new stub binding recompiles a few files instead of a
 - `0013-gif-path3-image-continuation.patch`: `sceGsExecLoadImage` sends the IMAGE GIFtag in one GIF DMA and the
   pixels in the next. The runtime parsed each DMA as a new packet and dropped the pixels, so fonts and CLUTs
   uploaded at boot were missing. PATH3 now carries an unfinished IMAGE over to the next transfer.
+- `0014-ee-thread-large-stack.patch`: every guest call is a nested host call, and the EE thread ran on a
+  `std::thread` with the platform default stack (1 MB on Windows). On Windows it overflowed (exit code
+  -1073741571 / 0xC00000FD) as soon as the sound and streaming threads started. The EE thread now gets a
+  256 MB reserved stack, and the main thread 16 MB on MSVC.
 
 ## Manual bindings
 

@@ -1,0 +1,131 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 5e80872..bd66c55 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -24,6 +24,104 @@
+ #include <chrono>
+ #include <atomic>
+ #include <thread>
++#include <functional>
++#include <memory>
++
++#if defined(_WIN32)
++#include <process.h>
++extern "C" __declspec(dllimport) unsigned long __stdcall WaitForSingleObject(void *handle, unsigned long milliseconds);
++extern "C" __declspec(dllimport) int __stdcall CloseHandle(void *handle);
++#else
++#include <pthread.h>
++#endif
++
++namespace
++{
++    // Every guest call is a nested host call in recompiled code, and guest threads share
++    // the EE host thread, so the EE thread needs far more stack than the platform default
++    // (1 MB on Windows, 512 KB on macOS). The stack is reserved, not committed up front.
++    class LargeStackThread
++    {
++    public:
++        static constexpr size_t kStackBytes = 256u * 1024u * 1024u;
++
++        explicit LargeStackThread(std::function<void()> body)
++        {
++            auto *heapBody = new std::function<void()>(std::move(body));
++#if defined(_WIN32)
++            constexpr unsigned kStackSizeIsReservation = 0x00010000u; // STACK_SIZE_PARAM_IS_A_RESERVATION
++            m_handle = _beginthreadex(nullptr, static_cast<unsigned>(kStackBytes), &trampoline, heapBody,
++                                      kStackSizeIsReservation, nullptr);
++            if (m_handle == 0u)
++            {
++                delete heapBody;
++                throw std::runtime_error("failed to start the EE host thread");
++            }
++#else
++            pthread_attr_t attr;
++            pthread_attr_init(&attr);
++            pthread_attr_setstacksize(&attr, kStackBytes);
++            const int rc = pthread_create(&m_thread, &attr, &trampoline, heapBody);
++            pthread_attr_destroy(&attr);
++            if (rc != 0)
++            {
++                delete heapBody;
++                throw std::runtime_error("failed to start the EE host thread");
++            }
++#endif
++            m_joinable = true;
++        }
++
++        LargeStackThread(const LargeStackThread &) = delete;
++        LargeStackThread &operator=(const LargeStackThread &) = delete;
++
++        ~LargeStackThread()
++        {
++            join();
++        }
++
++        bool joinable() const
++        {
++            return m_joinable;
++        }
++
++        void join()
++        {
++            if (!m_joinable)
++            {
++                return;
++            }
++#if defined(_WIN32)
++            WaitForSingleObject(reinterpret_cast<void *>(m_handle), 0xFFFFFFFFu);
++            CloseHandle(reinterpret_cast<void *>(m_handle));
++            m_handle = 0u;
++#else
++            pthread_join(m_thread, nullptr);
++#endif
++            m_joinable = false;
++        }
++
++    private:
++#if defined(_WIN32)
++        static unsigned __stdcall trampoline(void *arg)
++        {
++            std::unique_ptr<std::function<void()>> body(static_cast<std::function<void()> *>(arg));
++            (*body)();
++            return 0u;
++        }
++        uintptr_t m_handle = 0u;
++#else
++        static void *trampoline(void *arg)
++        {
++            std::unique_ptr<std::function<void()>> body(static_cast<std::function<void()> *>(arg));
++            (*body)();
++            return nullptr;
++        }
++        pthread_t m_thread{};
++#endif
++        bool m_joinable = false;
++    };
++}
+ #include <unordered_map>
+ #include <sstream>
+ 
+@@ -2374,7 +2472,7 @@ void PS2Runtime::run()
+ 
+     std::atomic<bool> gameThreadFinished{false};
+ 
+-    std::thread gameThread([&]()
++    LargeStackThread gameThread([&]()
+                            {
+         ThreadNaming::SetCurrentThreadName("GameThread");
+         try
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 589d768..1ac6c0d 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -575,6 +575,8 @@ endif()
+ # Work around WinAPI vs raylib symbol clash for CloseWindow on x64
+ if(MSVC)
+     target_link_options(ps2EntryRunner PRIVATE "/FORCE:MULTIPLE")
++    # Deeply nested recompiled calls need more than the 1 MB default main-thread stack.
++    target_link_options(ps2EntryRunner PRIVATE "/STACK:16777216")
+ endif()
+ 
+ # Vita: Work around for GCC 10's LTO plugin
