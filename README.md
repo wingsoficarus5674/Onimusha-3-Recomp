@@ -59,7 +59,8 @@ Those labels point at data, not code. The heuristic fallback config gives about 
    in `ghidra_project\`. Expect it to take 15–60 minutes. Everything it prints is saved to
    `config\1_ghidra_analyze_output.txt`. Ghidra's own launcher (`analyzeHeadless.bat`) can't handle `(` `)`
    in paths, so `ghidra_headless.ps1` starts Ghidra's Java entry point directly instead.
-2. `2_build_tools.bat` applies the patches below to PS2Recomp and builds `ps2_recomp.exe` and `ps2_analyzer.exe`.
+2. `2_build_tools.bat` applies the patches below to PS2Recomp (`apply_patches.ps1`; each patch once, recorded in
+   `tools\PS2Recomp\.onimusha3-applied-patches.txt`) and builds `ps2_recomp.exe` and `ps2_analyzer.exe`.
    Re-run it (then 3, 3b and 4) whenever a patch that changes the recompiler is added.
 3. `3_recompile.bat` turns the MIPS code into C++ in `output\`. The log goes to `recompile.log`. If there's no Ghidra config,
    it falls back to the analyzer config.

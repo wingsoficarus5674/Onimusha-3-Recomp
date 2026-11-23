@@ -32,10 +32,9 @@ rem ps2_recompiled_stubs.h only repeats declarations from ps2_recompiled_functio
 rem means a new stub binding rebuilds a few files instead of all ~64,000
 powershell -NoProfile -ExecutionPolicy Bypass -File sync_generated.ps1 -Src patches -Dst "%RT%\include" -Filter ps2_recompiled_stubs.h
 if errorlevel 1 (echo Sync FAILED. & exit /b 1)
-rem Apply this project's fixes to PS2Recomp (skips any already applied)
-for %%P in (patches\*.patch) do (
-  git apply --reverse --check --directory=tools/PS2Recomp "%%P" >nul 2>&1 || git apply --directory=tools/PS2Recomp "%%P" || (echo Failed to apply %%P & exit /b 1)
-)
+rem Apply this project's fixes to PS2Recomp (each once; the list is kept in tools\PS2Recomp)
+powershell -NoProfile -ExecutionPolicy Bypass -File apply_patches.ps1
+if errorlevel 1 (echo Patching PS2Recomp FAILED. & exit /b 1)
 rem Per-function trace logging (ps2_log.txt) makes the game very slow. Off by default;
 rem run "4_build_runtime.bat trace" to turn it on for debugging. Switching either way rebuilds everything.
 set "TRACE=OFF"

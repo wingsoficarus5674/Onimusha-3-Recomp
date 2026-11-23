@@ -6,10 +6,9 @@ cd /d "%~dp0"
 where cmake >nul 2>&1 || (echo CMake not found on PATH. Install from https://cmake.org/download/ & pause & exit /b 1)
 where git   >nul 2>&1 || (echo Git not found on PATH. Install from https://git-scm.com/download/win & pause & exit /b 1)
 
-rem Apply this project's fixes to PS2Recomp first (skips any already applied); some fix the recompiler
-for %%P in (patches\*.patch) do (
-  git apply --reverse --check --directory=tools/PS2Recomp "%%P" >nul 2>&1 || git apply --directory=tools/PS2Recomp "%%P" || (echo Failed to apply %%P & pause & exit /b 1)
-)
+rem Apply this project's fixes to PS2Recomp (each once; the list is kept in tools\PS2Recomp)
+powershell -NoProfile -ExecutionPolicy Bypass -File apply_patches.ps1
+if errorlevel 1 (echo Patching PS2Recomp FAILED. & pause & exit /b 1)
 cmake -S tools\PS2Recomp -B build\tools -DPS2X_BUILD_RUNTIME=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF || (pause & exit /b 1)
 cmake --build build\tools --config Release --parallel || (pause & exit /b 1)
 echo.
