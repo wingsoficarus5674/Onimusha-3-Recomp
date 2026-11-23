@@ -1,0 +1,245 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_cpu.cpp b/ps2xIOP/src/emulator/core/iop_cpu.cpp
+index e09642e..5754c86 100644
+--- a/ps2xIOP/src/emulator/core/iop_cpu.cpp
++++ b/ps2xIOP/src/emulator/core/iop_cpu.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ #include "iop_cpu.h"
+ #include "iop_memory.h"
+ 
+@@ -27,6 +28,27 @@ namespace ps2x::iop::detail
+         scheduledValue = value;
+     }
+ 
++    // This emulator implements the IOP kernel at a high level and installs no exception
++    // handler at the vector. Raising an address error there would run ~16K NOPs into whatever
++    // module code comes first, so without a handler a misaligned load/store is done at the
++    // aligned address instead (and reported).
++    bool IopCpuCore::exceptionHandlerInstalled() const
++    {
++        return m_memory.read32(0x80000080u) != 0u;
++    }
++
++    uint32_t IopCpuCore::alignAfterAddressError(uint32_t address, uint32_t mask, uint32_t pc, uint32_t code) const
++    {
++        static uint32_t reported = 0u;
++        if (reported < 8u)
++        {
++            ++reported;
++            std::fprintf(stderr, "[IOP] misaligned %s at pc=0x%x address=0x%x (no exception handler; using aligned address)\n",
++                         code == 4u ? "load" : "store", pc, address);
++        }
++        return address & mask;
++    }
++
+     void IopCpuCore::raiseException(IopCpuState &cpu, uint32_t code, uint32_t faultPc, bool delaySlot, std::optional<uint32_t> badAddress) const
+     {
+         uint32_t cause = cpu.cop0[13] & ~0x7Cu;
+@@ -342,11 +364,15 @@ namespace ps2x::iop::detail
+         case 0x21:
+         case 0x25:
+         {
+-            const uint32_t address = cpu.gpr[rs] + static_cast<uint32_t>(simm);
++            uint32_t address = cpu.gpr[rs] + static_cast<uint32_t>(simm);
+             if (address & 1u)
+             {
+-                raiseException(cpu, 4u, pc, wasDelaySlot, address);
+-                break;
++                if (exceptionHandlerInstalled())
++                {
++                    raiseException(cpu, 4u, pc, wasDelaySlot, address);
++                    break;
++                }
++                address = alignAfterAddressError(address, ~1u, pc, 4u);
+             }
+             const uint16_t value = m_memory.read16(address);
+             load(rt, opcode == 0x21 ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(value))) : value);
+@@ -364,11 +390,15 @@ namespace ps2x::iop::detail
+         }
+         case 0x23:
+         {
+-            const uint32_t address = cpu.gpr[rs] + static_cast<uint32_t>(simm);
++            uint32_t address = cpu.gpr[rs] + static_cast<uint32_t>(simm);
+             if (address & 3u)
+             {
+-                raiseException(cpu, 4u, pc, wasDelaySlot, address);
+-                break;
++                if (exceptionHandlerInstalled())
++                {
++                    raiseException(cpu, 4u, pc, wasDelaySlot, address);
++                    break;
++                }
++                address = alignAfterAddressError(address, ~3u, pc, 4u);
+             }
+             load(rt, m_memory.read32(address));
+             break;
+@@ -388,11 +418,15 @@ namespace ps2x::iop::detail
+             break;
+         case 0x29:
+         {
+-            const uint32_t address = cpu.gpr[rs] + static_cast<uint32_t>(simm);
++            uint32_t address = cpu.gpr[rs] + static_cast<uint32_t>(simm);
+             if (address & 1u)
+             {
+-                raiseException(cpu, 5u, pc, wasDelaySlot, address);
+-                break;
++                if (exceptionHandlerInstalled())
++                {
++                    raiseException(cpu, 5u, pc, wasDelaySlot, address);
++                    break;
++                }
++                address = alignAfterAddressError(address, ~1u, pc, 5u);
+             }
+             m_memory.write16(address, static_cast<uint16_t>(cpu.gpr[rt]));
+             break;
+@@ -424,11 +458,15 @@ namespace ps2x::iop::detail
+         }
+         case 0x2B:
+         {
+-            const uint32_t address = cpu.gpr[rs] + static_cast<uint32_t>(simm);
++            uint32_t address = cpu.gpr[rs] + static_cast<uint32_t>(simm);
+             if (address & 3u)
+             {
+-                raiseException(cpu, 5u, pc, wasDelaySlot, address);
+-                break;
++                if (exceptionHandlerInstalled())
++                {
++                    raiseException(cpu, 5u, pc, wasDelaySlot, address);
++                    break;
++                }
++                address = alignAfterAddressError(address, ~3u, pc, 5u);
+             }
+             m_memory.write32(address, cpu.gpr[rt]);
+             break;
+diff --git a/ps2xIOP/src/emulator/core/iop_cpu.h b/ps2xIOP/src/emulator/core/iop_cpu.h
+index f236050..d022c16 100644
+--- a/ps2xIOP/src/emulator/core/iop_cpu.h
++++ b/ps2xIOP/src/emulator/core/iop_cpu.h
+@@ -32,6 +32,8 @@ namespace ps2x::iop::detail
+ 
+         [[nodiscard]] bool executeInstruction(IopCpuState &cpu);
+         void raiseException(IopCpuState &cpu, uint32_t code, uint32_t faultPc, bool delaySlot, std::optional<uint32_t> badAddress = std::nullopt) const;
++        bool exceptionHandlerInstalled() const;
++        uint32_t alignAfterAddressError(uint32_t address, uint32_t mask, uint32_t pc, uint32_t code) const;
+ 
+     private:
+         static void writeRegister(IopCpuState &cpu, uint32_t reg, uint32_t value, uint32_t &writtenReg);
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 4832d8f..7b45430 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -146,8 +146,12 @@ namespace ps2x::iop::detail
+             setV0(0);
+             return true;
+         }
+-        case 16:
+-        case 17:
++        case 16: // RotateThreadReadyQueue
++        case 17: // iRotateThreadReadyQueue
++            // An explicit yield: let another ready thread of the same priority run next.
++            if (m_currentThread != nullptr)
++                m_rotatedThreadId = m_currentThread->id;
++            m_lastRunThreadId = -1;
+             setV0(0);
+             cpu.yielded = true;
+             return true;
+@@ -682,13 +686,35 @@ namespace ps2x::iop::detail
+         {
+             if (thread.state != IopThreadState::Ready)
+                 continue;
+-            if (next == nullptr || thread.priority < next->priority ||
+-                (thread.priority == next->priority && thread.id < next->id))
++            if (next == nullptr || thread.priority < next->priority)
++            {
++                next = &thread;
++                continue;
++            }
++            if (thread.priority != next->priority)
++                continue;
++            // Among equal priorities: a thread that just rotated the ready queue goes last.
++            const bool threadRotated = thread.id == m_rotatedThreadId;
++            const bool nextRotated = next->id == m_rotatedThreadId;
++            if ((nextRotated && !threadRotated) || (threadRotated == nextRotated && thread.id < next->id))
+                 next = &thread;
+         }
++        m_rotatedThreadId = -1;
+         if (next == nullptr)
+             return nullptr;
+ 
++        // The IOP kernel never preempts a running thread for another of the same priority: it
++        // keeps running until it blocks or a strictly higher-priority thread becomes ready.
++        // Timeslices here are only an emulation artefact, so the thread that ran last continues
++        // unless something strictly more important is ready.
++        if (const auto last = m_threads.find(m_lastRunThreadId); last != m_threads.end())
++        {
++            IopThread &previous = last->second;
++            if (previous.state == IopThreadState::Ready && previous.priority <= next->priority)
++                next = &previous;
++        }
++        m_lastRunThreadId = next->id;
++
+         m_currentThread = next;
+         next->state = IopThreadState::Running;
+         next->cpu.stopped = false;
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index 4977102..28f5a75 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -93,6 +93,8 @@ namespace ps2x::iop::detail
+ 
+         IopMemory &m_memory;
+         std::map<int, IopThread> m_threads;
++        int m_lastRunThreadId = -1; // thread that ran in the previous timeslice
++        int m_rotatedThreadId = -1; // thread that just called RotateThreadReadyQueue
+         std::map<int, Semaphore> m_semaphores;
+         std::map<int, EventFlag> m_eventFlags;
+         uint32_t m_nextThreadId = 1;
+diff --git a/ps2xIOP/src/emulator/imports/iop_sysclib.cpp b/ps2xIOP/src/emulator/imports/iop_sysclib.cpp
+index 0517478..da88053 100644
+--- a/ps2xIOP/src/emulator/imports/iop_sysclib.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_sysclib.cpp
+@@ -316,13 +316,13 @@ namespace ps2x::iop::detail
+         case 37: // atob
+             setV0(0);
+             return true;
+-        case 40: // _wmemcopy, count is 32-bit words
+-            for (uint32_t i = 0; i < a2; ++i)
++        case 40: // _wmemcopy(dest, src, size): size is in bytes, copied as 32-bit words
++            for (uint32_t i = 0; i < a2 / 4u; ++i)
+                 m_memory.write32(a0 + i * 4u, m_memory.read32(a1 + i * 4u));
+             setV0(a0);
+             return true;
+-        case 41:
+-            for (uint32_t i = 0; i < a2; ++i)
++        case 41: // _wmemset(dest, value, size): size is in bytes
++            for (uint32_t i = 0; i < a2 / 4u; ++i)
+                 m_memory.write32(a0 + i * 4u, a1);
+             setV0(a0);
+             return true;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index ac10e5a..c92a27c 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -790,11 +790,20 @@ namespace ps2x::iop::detail
+ 
+     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
+     {
++        // The EE scheduler reports elapsed time at every loop back-edge and call (8-32 EE
++        // cycles, i.e. 1-4 IOP cycles). Running the IOP for each of those spent most of the
++        // time in per-call bookkeeping, so time is batched into slices of kIopBatchCycles
++        // (about 14 us of PS2 time; far below anything the EE can observe).
++        constexpr uint64_t kIopBatchCycles = 512u;
+         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
+         const uint64_t iopCycles = total / 8u;
++        if (iopCycles < kIopBatchCycles)
++        {
++            m_impl->eeCycleCarry = total;
++            return;
++        }
+         m_impl->eeCycleCarry = total % 8u;
+-        if (iopCycles)
+-            m_impl->runCycles(iopCycles);
++        m_impl->runCycles(iopCycles);
+     }
+ 
+     RpcResult IopEmulator::handleRpc(const RpcRequest &request)

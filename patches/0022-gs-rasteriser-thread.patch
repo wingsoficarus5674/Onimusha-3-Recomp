@@ -1,0 +1,402 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index c41d84b..2a8746a 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -383,6 +383,7 @@ add_library(ps2_runtime STATIC
+     src/lib/gs/ps2_gs_memory.cpp
+     src/lib/gs/gs_frontend.cpp
+     src/lib/gs/gs_cpu_backend.cpp
++    src/lib/gs/gs_threaded_backend.cpp
+     src/lib/ps2_iop_host.cpp
+     src/lib/ps2_memory.cpp
+     src/lib/ps2_pad.cpp
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 9281d5f..d8327be 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1,5 +1,7 @@
++#include <cstdlib>
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/gs/gs_cpu_backend.h"
++#include "gs_threaded_backend.h"
+ #include "ps2_log.h"
+ #include "runtime/ps2_memory.h"
+ #include <atomic>
+@@ -105,8 +107,21 @@ namespace
+ }
+ 
+ 
++namespace
++{
++    // The CPU rasteriser runs on its own thread (see gs_threaded_backend.h) unless
++    // PS2X_GS_SYNC is set, which keeps it on the calling thread for debugging.
++    std::unique_ptr<GSRasterBackend> makeDefaultRasterBackend()
++    {
++        std::unique_ptr<GSRasterBackend> backend = std::make_unique<GSCpuBackend>();
++        if (std::getenv("PS2X_GS_SYNC") == nullptr)
++            backend = std::make_unique<GSThreadedBackend>(std::move(backend));
++        return backend;
++    }
++}
++
+ GS::GS()
+-    : m_backend(std::make_unique<GSCpuBackend>())
++    : m_backend(makeDefaultRasterBackend())
+ {
+     reset();
+ }
+@@ -117,7 +132,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+     m_localMemorySize = vramSize;
+     m_privRegs = privRegs;
+     if (!m_backend)
+-        m_backend = std::make_unique<GSCpuBackend>();
++        m_backend = makeDefaultRasterBackend();
+     m_backend->Initialize(vram, vramSize);
+     reset();
+ }
+@@ -1636,7 +1651,7 @@ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+ {
+     if (!backend)
+-        backend = std::make_unique<GSCpuBackend>();
++        backend = makeDefaultRasterBackend();
+ 
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+new file mode 100644
+index 0000000..ee12406
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -0,0 +1,236 @@
++#include "gs_threaded_backend.h"
++
++#include <utility>
++
++namespace
++{
++    // Bound the queue so a producer far ahead of the rasteriser can't use unbounded memory.
++    constexpr size_t kMaxQueuedCommands = 65536u;
++}
++
++GSThreadedBackend::GSThreadedBackend(std::unique_ptr<GSRasterBackend> inner)
++    : m_inner(std::move(inner))
++{
++    m_worker = std::thread([this]()
++                           { workerLoop(); });
++}
++
++GSThreadedBackend::~GSThreadedBackend()
++{
++    {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        m_stop = true;
++    }
++    m_workAvailable.notify_all();
++    if (m_worker.joinable())
++        m_worker.join();
++}
++
++void GSThreadedBackend::enqueue(Command &&command)
++{
++    std::unique_lock<std::mutex> lock(m_mutex);
++    if (m_queue.size() >= kMaxQueuedCommands)
++    {
++        m_idle.wait(lock, [this]()
++                    { return m_queue.size() < kMaxQueuedCommands / 2u || m_stop; });
++    }
++    const bool wasEmpty = m_queue.empty();
++    m_queue.push_back(std::move(command));
++    lock.unlock();
++    if (wasEmpty)
++        m_workAvailable.notify_one();
++}
++
++void GSThreadedBackend::drain() const
++{
++    std::unique_lock<std::mutex> lock(m_mutex);
++    m_idle.wait(lock, [this]()
++                { return (m_queue.empty() && !m_busy) || m_stop; });
++}
++
++void GSThreadedBackend::workerLoop()
++{
++    std::unique_lock<std::mutex> lock(m_mutex);
++    for (;;)
++    {
++        m_workAvailable.wait(lock, [this]()
++                             { return !m_queue.empty() || m_stop; });
++        if (m_stop && m_queue.empty())
++            return;
++
++        // Take the whole queue at once and run it without holding the lock.
++        std::deque<Command> work;
++        work.swap(m_queue);
++        m_busy = true;
++        lock.unlock();
++        m_idle.notify_all(); // producers waiting for queue space
++
++        for (Command &command : work)
++            execute(command);
++
++        lock.lock();
++        for (Command &command : work)
++        {
++            if (m_freeCommands.size() < 256u && command.bytes.capacity() != 0u)
++            {
++                command.bytes.clear();
++                m_freeCommands.push_back(std::move(command));
++            }
++        }
++        m_busy = false;
++        if (m_queue.empty())
++            m_idle.notify_all();
++    }
++}
++
++void GSThreadedBackend::execute(Command &command)
++{
++    switch (command.type)
++    {
++    case CommandType::Submit:
++        m_inner->Submit(command.batch);
++        break;
++    case CommandType::LoadClut:
++        m_inner->LoadClut(command.tex0, command.texclut);
++        break;
++    case CommandType::BeginTransfer:
++        m_inner->BeginTransfer(command.transfer);
++        break;
++    case CommandType::UploadImage:
++        m_inner->UploadImage(command.bytes.data(), static_cast<uint32_t>(command.bytes.size()));
++        break;
++    case CommandType::WriteVram:
++        m_inner->WriteVram(command.psm, command.base, command.bw, command.x, command.y, command.value);
++        break;
++    case CommandType::Flush:
++        m_inner->Flush();
++        break;
++    case CommandType::TextureFlush:
++        m_inner->TextureFlush();
++        break;
++    }
++}
++
++void GSThreadedBackend::Initialize(uint8_t *vram, uint32_t vramSize)
++{
++    drain();
++    m_inner->Initialize(vram, vramSize);
++}
++
++void GSThreadedBackend::Reset()
++{
++    drain();
++    m_inner->Reset();
++}
++
++void GSThreadedBackend::Submit(const GSPrimitiveBatch &batch)
++{
++    Command command;
++    command.type = CommandType::Submit;
++    command.batch = batch;
++    enqueue(std::move(command));
++}
++
++void GSThreadedBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
++{
++    Command command;
++    command.type = CommandType::LoadClut;
++    command.tex0 = tex0;
++    command.texclut = texclut;
++    enqueue(std::move(command));
++}
++
++void GSThreadedBackend::BeginTransfer(const GSTransferCommand &transfer)
++{
++    Command command;
++    command.type = CommandType::BeginTransfer;
++    command.transfer = transfer;
++    enqueue(std::move(command));
++}
++
++void GSThreadedBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
++{
++    if (!data || sizeBytes == 0u)
++        return;
++    Command command;
++    {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        if (!m_freeCommands.empty())
++        {
++            command = std::move(m_freeCommands.back());
++            m_freeCommands.pop_back();
++        }
++    }
++    command.type = CommandType::UploadImage;
++    command.bytes.assign(data, data + sizeBytes);
++    enqueue(std::move(command));
++}
++
++void GSThreadedBackend::Flush()
++{
++    Command command;
++    command.type = CommandType::Flush;
++    enqueue(std::move(command));
++}
++
++void GSThreadedBackend::TextureFlush()
++{
++    Command command;
++    command.type = CommandType::TextureFlush;
++    enqueue(std::move(command));
++}
++
++void GSThreadedBackend::Sync(GSSyncReason reason)
++{
++    drain();
++    m_inner->Sync(reason);
++}
++
++PresentationFrame GSThreadedBackend::Present(const GSPresentationRequest &request)
++{
++    drain();
++    return m_inner->Present(request);
++}
++
++bool GSThreadedBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
++{
++    drain();
++    return m_inner->ClearFramebuffer(context, rgba);
++}
++
++uint32_t GSThreadedBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
++{
++    drain();
++    return m_inner->ConsumeLocalToHostBytes(dst, maxBytes);
++}
++
++uint32_t GSThreadedBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
++{
++    drain();
++    return m_inner->ReadVram(psm, base, bw, x, y);
++}
++
++void GSThreadedBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
++{
++    Command command;
++    command.type = CommandType::WriteVram;
++    command.psm = psm;
++    command.base = base;
++    command.bw = bw;
++    command.x = x;
++    command.y = y;
++    command.value = value;
++    enqueue(std::move(command));
++}
++
++void GSThreadedBackend::SnapshotVram(std::vector<uint8_t> &out) const
++{
++    drain();
++    m_inner->SnapshotVram(out);
++}
++
++GSTransferSnapshot GSThreadedBackend::GetTransferSnapshot() const
++{
++    drain();
++    return m_inner->GetTransferSnapshot();
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.h b/ps2xRuntime/src/lib/gs/gs_threaded_backend.h
+new file mode 100644
+index 0000000..ac3d225
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.h
+@@ -0,0 +1,89 @@
++#pragma once
++
++#include "runtime/gs/gs_backend.h"
++
++#include <condition_variable>
++#include <cstdint>
++#include <deque>
++#include <memory>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++// Runs a GS raster backend on its own thread, like the real GS runs alongside the EE and VUs.
++//
++// Commands that only change GS memory (primitives, CLUT loads, image uploads, VRAM writes,
++// flushes) are queued and executed in order by the worker thread. Every call that returns
++// something or makes results visible (Sync, Present, VRAM reads and snapshots, local->host
++// reads, clears, transfer state) first waits until the worker has executed everything queued
++// before it, then calls the wrapped backend directly, so results are identical to running the
++// backend synchronously.
++//
++// All callers go through GS, which holds its state mutex around every backend call, so no new
++// command can be queued while a caller waits for the queue to drain.
++class GSThreadedBackend final : public GSRasterBackend
++{
++public:
++    explicit GSThreadedBackend(std::unique_ptr<GSRasterBackend> inner);
++    ~GSThreadedBackend() override;
++
++    void Initialize(uint8_t *vram, uint32_t vramSize) override;
++    void Reset() override;
++
++    void Submit(const GSPrimitiveBatch &batch) override;
++    void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override;
++
++    void BeginTransfer(const GSTransferCommand &command) override;
++    void UploadImage(const uint8_t *data, uint32_t sizeBytes) override;
++
++    void Flush() override;
++    void TextureFlush() override;
++    void Sync(GSSyncReason reason) override;
++    PresentationFrame Present(const GSPresentationRequest &request) override;
++
++    bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
++    uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override;
++
++    uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override;
++    void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override;
++    void SnapshotVram(std::vector<uint8_t> &out) const override;
++    GSTransferSnapshot GetTransferSnapshot() const override;
++
++private:
++    enum class CommandType : uint8_t
++    {
++        Submit,
++        LoadClut,
++        BeginTransfer,
++        UploadImage,
++        WriteVram,
++        Flush,
++        TextureFlush,
++    };
++
++    struct Command
++    {
++        CommandType type = CommandType::Flush;
++        GSPrimitiveBatch batch{};
++        GSTex0Reg tex0{};
++        GSTexClutReg texclut{};
++        GSTransferCommand transfer{};
++        std::vector<uint8_t> bytes;
++        uint32_t psm = 0, base = 0, bw = 0, x = 0, y = 0, value = 0;
++    };
++
++    void enqueue(Command &&command);
++    void drain() const;
++    void workerLoop();
++    void execute(Command &command);
++
++    std::unique_ptr<GSRasterBackend> m_inner;
++    mutable std::mutex m_mutex;
++    mutable std::condition_variable m_workAvailable;
++    mutable std::condition_variable m_idle;
++    std::deque<Command> m_queue;
++    std::vector<Command> m_freeCommands; // reused to avoid reallocating vectors
++    bool m_busy = false;
++    bool m_stop = false;
++    std::thread m_worker;
++};

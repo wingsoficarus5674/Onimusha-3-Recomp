@@ -140,6 +140,18 @@ keeping it constant means a new stub binding recompiles a few files instead of a
 - `0020-controller-support.patch`: every connected controller is used (two PS2 ports, hot-plug), with
   SDL GameControllerDB mappings loaded at start-up, a raw fallback for unmapped devices, stick deadzones,
   analog L2/R2 pressure, and the keyboard working alongside controllers. See "Controls".
+- `0021-vu1-interpreter-speedups.patch`: the VU1 interpreter (all 3D geometry) is about 2.3x faster with
+  bit-identical results: exact-flag checks are skipped when the float result already proves them, pipeline
+  queues are only scanned when an entry is due, XGKICK no longer clears a 64 KB buffer per kick, and the three
+  VU source files are compiled as one unit so per-instruction helpers inline.
+- `0022-gs-rasteriser-thread.patch`: the software GS rasteriser runs on its own thread, alongside the game,
+  like the real GS. Anything that reads results back (presentation, VRAM reads, FINISH) waits for queued
+  drawing first, so output is unchanged. `PS2X_GS_SYNC=1` runs it on the game thread again (for debugging).
+- `0023-iop-speed-and-correctness.patch`: the IOP is run in batches instead of after every EE loop iteration;
+  `_wmemcopy`/`_wmemset` (sysclib 40/41) took their size as words instead of bytes and overwrote memory
+  (it corrupted SNDDRV's sound-bank state); IOP threads are no longer preempted by threads of the same
+  priority (the IOP kernel doesn't do that); and a misaligned load/store with no exception handler is done at
+  the aligned address instead of jumping into empty memory.
 
 ## Manual bindings
 
@@ -236,6 +248,10 @@ in this runtime a guest thread that never makes a syscall would never yield.
 17. ~~Black screen in gameplay: every vertex at 0,0~~ (patches 0018, 0019; libvu0 is no longer replaced by
     the runtime's HLE versions, the game's own routines are recompiled)
 18. NEW GAME starts and the 3D gameplay renders.
+19. Speed (patches 0021-0023): menus run at full speed; 3D gameplay is about 2x faster than before but not yet
+    full speed. Where the time goes now: the VU1 interpreter (3D geometry) and the IOP, which spends most of
+    its time in CRI's ADX audio decoder because SPU2 streaming DMA completes instantly instead of at playback
+    speed (pacing it correctly stops the game after the title screen, still under investigation).
 
 ## Code overlays
 
