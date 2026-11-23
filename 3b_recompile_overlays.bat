@@ -33,20 +33,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File overlays.ps1 -GhidraScript t
 if errorlevel 1 (echo Could not prepare the Ghidra export script. & exit /b 1)
 
 echo [2/4] Ghidra analysis of the modules...
-rem Ghidra's launch.bat breaks on ")" in any argument, so map this folder to a free drive letter.
-set "REALROOT=%CD%"
-set "DRV="
-for %%L in (P Q R S T U V W X Y Z) do if not defined DRV if not exist %%L:\ set "DRV=%%L:"
-if not defined DRV (echo ERROR: could not map a free drive letter P: to Z: with subst. & exit /b 1)
-subst %DRV% "%REALROOT%"
-if errorlevel 1 (echo ERROR: subst failed. & exit /b 1)
-pushd %DRV%\
-set "JAVA_HOME=%DRV%\tools\jdk-25.0.5.1+2"
-set "PATH=%JAVA_HOME%\bin;%PATH%"
-set "GHIDRA_HEADLESS_MAXMEM=4G"
-call "%DRV%\tools\ghidra_12.2_PUBLIC\support\analyzeHeadless.bat" "%DRV%\%WORK%\ghidra_project" overlays -import "%DRV%\%WORK%\elf" -recursive -deleteProject -processor r5900:LE:32:default -scriptPath "%DRV%\%WORK%\ghidra_scripts" -preScript SeedOverlayFunctions.java "%DRV%\%WORK%\seeds" -postScript ExportPS2Overlay.java "%DRV%\%WORK%\csv" -log "%DRV%\%WORK%\ghidra_headless.log"
-popd
-subst %DRV% /d
+rem Ghidra's analyzeHeadless.bat/launch.bat cannot cope with "(USA)" in this folder's path (cmd.exe
+rem parse errors), so ghidra_headless.ps1 starts Ghidra's Java entry point directly instead.
+powershell -NoProfile -ExecutionPolicy Bypass -File ghidra_headless.ps1 "%CD%\tools\ghidra_12.2_PUBLIC" "%CD%\tools\jdk-25.0.5.1+2" 4G "%CD%\%WORK%\ghidra_project" overlays -import "%CD%\%WORK%\elf" -recursive -deleteProject -processor r5900:LE:32:default -scriptPath "%CD%\%WORK%\ghidra_scripts" -preScript SeedOverlayFunctions.java "%CD%\%WORK%\seeds" -postScript ExportPS2Overlay.java "%CD%\%WORK%\csv" -log "%CD%\%WORK%\ghidra_headless.log"
 set "NCSV=0"
 for %%F in ("%WORK%\csv\*.csv") do set /a NCSV+=1
 set "NELF=0"
