@@ -1,0 +1,671 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_pad_host.h b/ps2xRuntime/include/runtime/ps2_pad_host.h
+new file mode 100644
+index 0000000..70ff00c
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_pad_host.h
+@@ -0,0 +1,19 @@
++#ifndef PS2_PAD_HOST_H
++#define PS2_PAD_HOST_H
++
++// Host controller support for PSPadBackend (see ps2_pad.cpp).
++//
++// Every controller the host sees is used. Controllers known to SDL's GameControllerDB
++// (Xbox, PlayStation, Switch, 8BitDo, Logitech, generic USB pads, PS2-to-USB adapters,
++// ...) get a standard layout; gamecontrollerdb.txt and an optional
++// gamecontrollerdb_user.txt next to the executable or in the working folder are loaded
++// at start-up. Devices without a mapping fall back to the raw layout of PS2-to-USB
++// adapters. The first controller (plus the keyboard) is port 1, the second is port 2.
++//
++// ps2PadHostInit() and ps2PadHostPoll() run on the window (main) thread; PSPadBackend
++// readState() on the game thread only reads the snapshot taken by the last poll.
++void ps2PadHostInit();
++void ps2PadHostPoll();
++bool ps2PadHostConnected(int port);
++
++#endif
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+index 1c0ab86..ed57ded 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+@@ -1,5 +1,6 @@
+ #include "Common.h"
+ #include "Pad.h"
++#include "runtime/ps2_pad_host.h"
+ 
+ namespace ps2_stubs
+ {
+@@ -880,10 +881,14 @@ namespace ps2_stubs
+         constexpr int32_t kPad2ReadSize = 18; // 2 button bytes, 4 sticks, 12 pressures
+         constexpr int32_t kPad2ProfileSize = 4;
+ 
+-        // Only port 0 has a controller attached.
+-        bool socketHasController(uint32_t socket)
++        // Port 1 always has a controller (keyboard / first host controller); port 2
++        // when a second host controller is connected.
++        bool socketHasController(uint32_t socket, PS2Runtime *runtime)
+         {
+-            return socket == 0u;
++            (void)runtime;
++            if (socket == 0u)
++                return true;
++            return socket == 1u && ps2PadHostConnected(1);
+         }
+ 
+         // sceDbcInit(): report success; DBCMAN is not used by the HLE path.
+@@ -912,7 +917,7 @@ namespace ps2_stubs
+         {
+             (void)rdram;
+             (void)runtime;
+-            setReturnS32(ctx, socketHasController(getRegU32(ctx, 4)) ? kPad2StateStable : kPad2StateNoLink);
++            setReturnS32(ctx, socketHasController(getRegU32(ctx, 4), runtime) ? kPad2StateStable : kPad2StateNoLink);
+         }
+ 
+         // scePad2GetButtonProfile(int socket, unsigned char *profile) and the
+@@ -920,8 +925,7 @@ namespace ps2_stubs
+         // both sticks and pressure sensitivity.
+         void getProfile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+         {
+-            (void)runtime;
+-            if (!socketHasController(getRegU32(ctx, 4)))
++            if (!socketHasController(getRegU32(ctx, 4), runtime))
+             {
+                 setReturnS32(ctx, -1);
+                 return;
+@@ -941,7 +945,7 @@ namespace ps2_stubs
+         {
+             const uint32_t socket = getRegU32(ctx, 4);
+             uint8_t *out = getMemPtr(rdram, getRegU32(ctx, 5));
+-            if (!out || !socketHasController(socket))
++            if (!out || !socketHasController(socket, runtime))
+             {
+                 setReturnS32(ctx, -1);
+                 return;
+@@ -958,17 +962,9 @@ namespace ps2_stubs
+             // Buttons (active low, libpad bit order) and sticks: RX, RY, LX, LY.
+             std::memcpy(out, pad + 2, 6);
+ 
+-            // Pressures: right, left, up, down, triangle, circle, cross, square, L1, R1, L2, R2.
+-            const uint16_t pressed = static_cast<uint16_t>(~(pad[2] | (pad[3] << 8)));
+-            static constexpr uint16_t kPressureOrder[12] = {
+-                1u << 5, 1u << 7, 1u << 4, 1u << 6,     // right, left, up, down
+-                1u << 12, 1u << 13, 1u << 14, 1u << 15, // triangle, circle, cross, square
+-                1u << 10, 1u << 11, 1u << 8, 1u << 9,   // L1, R1, L2, R2
+-            };
+-            for (int i = 0; i < 12; ++i)
+-            {
+-                out[6 + i] = (pressed & kPressureOrder[i]) ? 0xFF : 0x00;
+-            }
++            // Pressures: right, left, up, down, triangle, circle, cross, square, L1, R1, L2, R2
++            // (analog for L2/R2 on controllers with analog triggers).
++            std::memcpy(out + 6, pad + 8, 12);
+             setReturnS32(ctx, kPad2ReadSize);
+         }
+     }
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 8590f14..0d553a7 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1,125 +1,429 @@
+ #include "runtime/ps2_pad.h"
++#include "runtime/ps2_pad_host.h"
+ #include "ps2_host_backend.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <fstream>
++#include <mutex>
++#include <sstream>
++#include <string>
++#include <vector>
++
++#if defined(PLATFORM_DESKTOP) && !defined(PLATFORM_DESKTOP_SDL) && !defined(PLATFORM_DESKTOP_RGFW) && !defined(PLATFORM_VITA) && defined(__has_include)
++#if __has_include(<GLFW/glfw3.h>)
++#define GLFW_INCLUDE_NONE
++#include <GLFW/glfw3.h>
++#define PS2X_PAD_HAVE_GLFW 1
++#endif
++#endif
+ 
+ namespace
+ {
+     constexpr uint8_t kPadAnalogMarker = 0x73;
+-    constexpr uint8_t kPadStickCenter = 0x80;
+-
+-    constexpr uint16_t PAD_LEFT = 0x0080u;
+-    constexpr uint16_t PAD_DOWN = 0x0040u;
+-    constexpr uint16_t PAD_RIGHT = 0x0020u;
+-    constexpr uint16_t PAD_UP = 0x0010u;
+-    constexpr uint16_t PAD_START = 0x0008u;
+-    constexpr uint16_t PAD_R3 = 0x0004u;
+-    constexpr uint16_t PAD_L3 = 0x0002u;
+-    constexpr uint16_t PAD_SELECT = 0x0001u;
+-    constexpr uint16_t PAD_SQUARE = 0x8000u;
+-    constexpr uint16_t PAD_CROSS = 0x4000u;
+-    constexpr uint16_t PAD_CIRCLE = 0x2000u;
+-    constexpr uint16_t PAD_TRIANGLE = 0x1000u;
+-    constexpr uint16_t PAD_R1 = 0x0800u;
+-    constexpr uint16_t PAD_L1 = 0x0400u;
+-    constexpr uint16_t PAD_R2 = 0x0200u;
+-    constexpr uint16_t PAD_L2 = 0x0100u;
++    constexpr int kHostPadCount = 4; // raylib MAX_GAMEPADS
++
++    constexpr uint16_t PAD_SELECT = 1u << 0;
++    constexpr uint16_t PAD_L3 = 1u << 1;
++    constexpr uint16_t PAD_R3 = 1u << 2;
++    constexpr uint16_t PAD_START = 1u << 3;
++    constexpr uint16_t PAD_UP = 1u << 4;
++    constexpr uint16_t PAD_RIGHT = 1u << 5;
++    constexpr uint16_t PAD_DOWN = 1u << 6;
++    constexpr uint16_t PAD_LEFT = 1u << 7;
++    constexpr uint16_t PAD_L2 = 1u << 8;
++    constexpr uint16_t PAD_R2 = 1u << 9;
++    constexpr uint16_t PAD_L1 = 1u << 10;
++    constexpr uint16_t PAD_R1 = 1u << 11;
++    constexpr uint16_t PAD_TRIANGLE = 1u << 12;
++    constexpr uint16_t PAD_CIRCLE = 1u << 13;
++    constexpr uint16_t PAD_CROSS = 1u << 14;
++    constexpr uint16_t PAD_SQUARE = 1u << 15;
++
++    // libpad pressure order.
++    constexpr uint16_t kPressureOrder[12] = {
++        PAD_RIGHT, PAD_LEFT, PAD_UP, PAD_DOWN,
++        PAD_TRIANGLE, PAD_CIRCLE, PAD_CROSS, PAD_SQUARE,
++        PAD_L1, PAD_R1, PAD_L2, PAD_R2};
++    constexpr int kPressureL2 = 10;
++    constexpr int kPressureR2 = 11;
++
++    constexpr float kStickDeadzone = 0.15f;
++    constexpr float kTriggerThreshold = 0.25f;
++
++    // Input gathered from one host device, before conversion to PS2 bytes.
++    struct HostPad
++    {
++        uint16_t pressed = 0u; // active high
++        float lx = 0.0f, ly = 0.0f, rx = 0.0f, ry = 0.0f;
++        float l2 = 0.0f, r2 = 0.0f; // 0..1, analog triggers
++    };
++
++    float applyDeadzone(float v)
++    {
++        if (!std::isfinite(v))
++            return 0.0f;
++        v = std::clamp(v, -1.0f, 1.0f);
++        const float a = std::fabs(v);
++        if (a < kStickDeadzone)
++            return 0.0f;
++        const float scaled = (a - kStickDeadzone) / (1.0f - kStickDeadzone);
++        return v < 0.0f ? -scaled : scaled;
++    }
++
++    uint8_t axisToByte(float v)
++    {
++        v = std::clamp(v, -1.0f, 1.0f);
++        return static_cast<uint8_t>(std::lround((v + 1.0f) * 127.5f));
++    }
++
++    // Trigger axes run from -1 (released) to +1 (fully pressed).
++    float triggerToUnit(float v)
++    {
++        if (!std::isfinite(v))
++            return 0.0f;
++        v = std::clamp(v, -1.0f, 1.0f);
++        return (v + 1.0f) * 0.5f;
++    }
++
++    bool readTextFile(const std::string &path, std::string &out)
++    {
++        std::ifstream in(path, std::ios::binary);
++        if (!in)
++            return false;
++        std::ostringstream ss;
++        ss << in.rdbuf();
++        out = ss.str();
++        return !out.empty();
++    }
++
++    void readMappedPad(int gamepad, HostPad &pad)
++    {
++        auto down = [gamepad](int button)
++        { return IsGamepadButtonDown(gamepad, button); };
++        auto set = [&pad](uint16_t mask, bool on)
++        { if (on) pad.pressed |= mask; };
++
++        // Positional layout: the bottom face button is Cross on every controller
++        // (A on Xbox, B on Nintendo), right = Circle, left = Square, top = Triangle.
++        set(PAD_UP, down(GAMEPAD_BUTTON_LEFT_FACE_UP));
++        set(PAD_DOWN, down(GAMEPAD_BUTTON_LEFT_FACE_DOWN));
++        set(PAD_LEFT, down(GAMEPAD_BUTTON_LEFT_FACE_LEFT));
++        set(PAD_RIGHT, down(GAMEPAD_BUTTON_LEFT_FACE_RIGHT));
++        set(PAD_CROSS, down(GAMEPAD_BUTTON_RIGHT_FACE_DOWN));
++        set(PAD_CIRCLE, down(GAMEPAD_BUTTON_RIGHT_FACE_RIGHT));
++        set(PAD_SQUARE, down(GAMEPAD_BUTTON_RIGHT_FACE_LEFT));
++        set(PAD_TRIANGLE, down(GAMEPAD_BUTTON_RIGHT_FACE_UP));
++        set(PAD_L1, down(GAMEPAD_BUTTON_LEFT_TRIGGER_1));
++        set(PAD_R1, down(GAMEPAD_BUTTON_RIGHT_TRIGGER_1));
++        set(PAD_L3, down(GAMEPAD_BUTTON_LEFT_THUMB));
++        set(PAD_R3, down(GAMEPAD_BUTTON_RIGHT_THUMB));
++        set(PAD_SELECT, down(GAMEPAD_BUTTON_MIDDLE_LEFT));
++        set(PAD_START, down(GAMEPAD_BUTTON_MIDDLE_RIGHT));
++
++        pad.lx = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_X);
++        pad.ly = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_Y);
++        pad.rx = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_X);
++        pad.ry = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y);
++
++        // Analog triggers (Xbox, DualShock 4, DualSense) report an axis; digital ones
++        // (Switch, many generic pads) only a button.
++        pad.l2 = triggerToUnit(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_TRIGGER));
++        pad.r2 = triggerToUnit(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_TRIGGER));
++        if (down(GAMEPAD_BUTTON_LEFT_TRIGGER_2))
++            pad.l2 = std::max(pad.l2, 1.0f);
++        if (down(GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
++            pad.r2 = std::max(pad.r2, 1.0f);
++    }
++
++#if defined(PS2X_PAD_HAVE_GLFW)
++    // Devices GLFW has no gamepad mapping for. Layout of the common PS2-to-USB
++    // adapters and DirectInput pads: 0 Triangle, 1 Circle, 2 Cross, 3 Square,
++    // 4 L2, 5 R2, 6 L1, 7 R1, 8 Select, 9 Start, 10 L3, 11 R3; first hat = D-pad;
++    // axes 0/1 left stick, 2/3 right stick.
++    void readRawJoystick(int jid, HostPad &pad)
++    {
++        int buttonCount = 0;
++        const unsigned char *buttons = glfwGetJoystickButtons(jid, &buttonCount);
++        static constexpr uint16_t kRawButtons[12] = {
++            PAD_TRIANGLE, PAD_CIRCLE, PAD_CROSS, PAD_SQUARE,
++            PAD_L2, PAD_R2, PAD_L1, PAD_R1,
++            PAD_SELECT, PAD_START, PAD_L3, PAD_R3};
++        for (int i = 0; buttons && i < buttonCount && i < 12; ++i)
++        {
++            if (buttons[i] == GLFW_PRESS)
++                pad.pressed |= kRawButtons[i];
++        }
++        if (pad.pressed & PAD_L2)
++            pad.l2 = 1.0f;
++        if (pad.pressed & PAD_R2)
++            pad.r2 = 1.0f;
++
++        int hatCount = 0;
++        const unsigned char *hats = glfwGetJoystickHats(jid, &hatCount);
++        if (hats && hatCount > 0)
++        {
++            if (hats[0] & GLFW_HAT_UP)
++                pad.pressed |= PAD_UP;
++            if (hats[0] & GLFW_HAT_DOWN)
++                pad.pressed |= PAD_DOWN;
++            if (hats[0] & GLFW_HAT_LEFT)
++                pad.pressed |= PAD_LEFT;
++            if (hats[0] & GLFW_HAT_RIGHT)
++                pad.pressed |= PAD_RIGHT;
++        }
++
++        int axisCount = 0;
++        const float *axes = glfwGetJoystickAxes(jid, &axisCount);
++        if (axes)
++        {
++            if (axisCount > 0)
++                pad.lx = axes[0];
++            if (axisCount > 1)
++                pad.ly = axes[1];
++            if (axisCount > 2)
++                pad.rx = axes[2];
++            if (axisCount > 3)
++                pad.ry = axes[3];
++        }
++    }
++#endif
++
++    void readKeyboard(HostPad &pad)
++    {
++        auto set = [&pad](uint16_t mask, bool on)
++        { if (on) pad.pressed |= mask; };
++        set(PAD_UP, IsKeyDown(KEY_UP) || IsKeyDown(KEY_W));
++        set(PAD_DOWN, IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S));
++        set(PAD_LEFT, IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A));
++        set(PAD_RIGHT, IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D));
++        set(PAD_CROSS, IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE));
++        set(PAD_CIRCLE, IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE));
++        set(PAD_SQUARE, IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0));
++        set(PAD_TRIANGLE, IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1));
++        set(PAD_L1, IsKeyDown(KEY_Q));
++        set(PAD_R1, IsKeyDown(KEY_E));
++        set(PAD_L2, IsKeyDown(KEY_LEFT_SHIFT));
++        set(PAD_R2, IsKeyDown(KEY_RIGHT_SHIFT));
++        set(PAD_START, IsKeyDown(KEY_ENTER));
++        set(PAD_SELECT, IsKeyDown(KEY_TAB));
++        set(PAD_L3, IsKeyDown(KEY_LEFT_CONTROL));
++        set(PAD_R3, IsKeyDown(KEY_RIGHT_CONTROL));
++        if (pad.pressed & PAD_L2)
++            pad.l2 = 1.0f;
++        if (pad.pressed & PAD_R2)
++            pad.r2 = 1.0f;
++    }
++
++    // Combine several sources: buttons OR'd, the stick/trigger with the largest deflection wins.
++    void mergeInto(HostPad &dst, const HostPad &src)
++    {
++        dst.pressed |= src.pressed;
++        auto pick = [](float a, float b)
++        { return std::fabs(b) > std::fabs(a) ? b : a; };
++        dst.lx = pick(dst.lx, applyDeadzone(src.lx));
++        dst.ly = pick(dst.ly, applyDeadzone(src.ly));
++        dst.rx = pick(dst.rx, applyDeadzone(src.rx));
++        dst.ry = pick(dst.ry, applyDeadzone(src.ry));
++        dst.l2 = std::max(dst.l2, src.l2);
++        dst.r2 = std::max(dst.r2, src.r2);
++    }
++
++    void toSnapshotFields(const HostPad &pad, uint16_t &buttons, uint8_t &rx, uint8_t &ry,
++                          uint8_t &lx, uint8_t &ly, uint8_t (&pressure)[12])
++    {
++        uint16_t pressed = pad.pressed;
++        if (pad.l2 >= kTriggerThreshold)
++            pressed |= PAD_L2;
++        if (pad.r2 >= kTriggerThreshold)
++            pressed |= PAD_R2;
++        buttons = static_cast<uint16_t>(~pressed);
++        lx = axisToByte(pad.lx);
++        ly = axisToByte(pad.ly);
++        rx = axisToByte(pad.rx);
++        ry = axisToByte(pad.ry);
++        for (int i = 0; i < 12; ++i)
++            pressure[i] = (pressed & kPressureOrder[i]) ? 0xFFu : 0x00u;
++        if (pressed & PAD_L2)
++            pressure[kPressureL2] = static_cast<uint8_t>(std::lround(std::clamp(pad.l2, 0.0f, 1.0f) * 255.0f));
++        if (pressed & PAD_R2)
++            pressure[kPressureR2] = static_cast<uint8_t>(std::lround(std::clamp(pad.r2, 0.0f, 1.0f) * 255.0f));
++    }
+ }
+ 
+-bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
++
++namespace
+ {
+-    if (!data || size < 32)
++    constexpr int kMaxPorts = 2;
++
++    struct PortSnapshot
++    {
++        bool connected = false;
++        uint16_t buttons = 0xFFFFu;
++        uint8_t rx = 0x80, ry = 0x80, lx = 0x80, ly = 0x80;
++        uint8_t pressure[12]{};
++    };
++
++    std::mutex g_padMutex;
++    PortSnapshot g_ports[kMaxPorts]{};
++    bool g_polled = false;
++    bool g_hostReady = false;
++    std::string g_lastNames[kHostPadCount];
++}
++
++void ps2PadHostInit()
++{
++    if (g_hostReady || !IsWindowReady())
++        return;
++    g_hostReady = true;
++
++    // SDL GameControllerDB: thousands of controller mappings (zlib licence).
++    std::vector<std::string> dirs;
++    if (const char *appDir = GetApplicationDirectory())
++        dirs.emplace_back(appDir);
++    dirs.emplace_back("");
++
++    int loadedFiles = 0;
++    auto loadFile = [&loadedFiles](const std::string &path)
++    {
++        std::string text;
++        if (!readTextFile(path, text))
++            return false;
++        const int result = SetGamepadMappings(text.c_str());
++        std::fprintf(stderr, "[pad] loaded controller mappings from %s (%s)\n", path.c_str(), result ? "ok" : "some lines rejected");
++        ++loadedFiles;
++        return true;
++    };
++    for (const char *name : {"gamecontrollerdb.txt", "gamecontrollerdb_user.txt"})
++    {
++        for (const std::string &dir : dirs)
++        {
++            if (loadFile(dir + name))
++                break;
++        }
++    }
++    if (const char *path = std::getenv("PS2X_GAMECONTROLLERDB"))
++        loadFile(path);
++    // Same variable SDL games use for custom mappings.
++    if (const char *mapping = std::getenv("SDL_GAMECONTROLLERCONFIG"))
++    {
++        SetGamepadMappings(mapping);
++        ++loadedFiles;
++    }
++    if (loadedFiles == 0)
++        std::fprintf(stderr, "[pad] gamecontrollerdb.txt not found; using GLFW's built-in controller mappings\n");
++}
++
++static void pollDirect(PortSnapshot (&ports)[kMaxPorts])
++{
++    HostPad merged[kMaxPorts];
++    bool connected[kMaxPorts] = {true, false}; // port 1 always has the keyboard
++
++    int nextPort = 0;
++    for (int i = 0; i < kHostPadCount && nextPort < kMaxPorts; ++i)
++    {
++        if (!IsGamepadAvailable(i))
++        {
++            if (!g_lastNames[i].empty())
++            {
++                std::fprintf(stderr, "[pad] controller %d disconnected: %s\n", i + 1, g_lastNames[i].c_str());
++                g_lastNames[i].clear();
++            }
++            continue;
++        }
++
++        HostPad pad;
++        bool mapped = true;
++#if defined(PS2X_PAD_HAVE_GLFW)
++        mapped = glfwJoystickIsGamepad(GLFW_JOYSTICK_1 + i) == GLFW_TRUE;
++        if (!mapped)
++            readRawJoystick(GLFW_JOYSTICK_1 + i, pad);
++#endif
++        if (mapped)
++            readMappedPad(i, pad);
++
++        const char *name = GetGamepadName(i);
++        const std::string label = name ? name : "controller";
++        if (g_lastNames[i] != label)
++        {
++            g_lastNames[i] = label;
++            std::fprintf(stderr, "[pad] controller %d connected: %s (%s) -> PS2 port %d\n", i + 1, label.c_str(),
++                         mapped ? "mapped" : "no mapping, generic layout", nextPort + 1);
++        }
++
++        mergeInto(merged[nextPort], pad);
++        connected[nextPort] = true;
++        ++nextPort;
++    }
++
++    HostPad keyboard;
++    readKeyboard(keyboard);
++    merged[0].pressed |= keyboard.pressed;
++    merged[0].l2 = std::max(merged[0].l2, keyboard.l2);
++    merged[0].r2 = std::max(merged[0].r2, keyboard.r2);
++
++    for (int p = 0; p < kMaxPorts; ++p)
++    {
++        PortSnapshot &s = ports[p];
++        s.connected = connected[p];
++        toSnapshotFields(merged[p], s.buttons, s.rx, s.ry, s.lx, s.ly, s.pressure);
++    }
++}
++
++void ps2PadHostPoll()
++{
++    if (!IsWindowReady())
++        return;
++    if (!g_hostReady)
++        ps2PadHostInit();
++    PortSnapshot ports[kMaxPorts];
++    pollDirect(ports);
++    std::lock_guard<std::mutex> lock(g_padMutex);
++    for (int p = 0; p < kMaxPorts; ++p)
++        g_ports[p] = ports[p];
++    g_polled = true;
++}
++
++bool ps2PadHostConnected(int port)
++{
++    if (port < 0 || port >= kMaxPorts)
+         return false;
++    std::lock_guard<std::mutex> lock(g_padMutex);
++    return port == 0 || (g_polled && g_ports[port].connected);
++}
+ 
+-    std::memset(data, 0, 32);
+-    data[0] = 0x01;
+-    data[1] = kPadAnalogMarker;
+-    data[2] = 0xFF;
+-    data[3] = 0xFF;
+-    data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
+-
+-    uint16_t btns = 0xFFFFu;
+-    constexpr int kGamepad = 0;
+-    const bool useGamepad = IsGamepadAvailable(kGamepad);
+-    auto clearBit = [&btns](uint16_t mask)
+-    { btns &= ~mask; };
+-
+-    if (useGamepad)
+-    {
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_UP))
+-            clearBit(PAD_UP);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
+-            clearBit(PAD_DOWN);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT))
+-            clearBit(PAD_LEFT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
+-            clearBit(PAD_RIGHT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
+-            clearBit(PAD_CROSS);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
+-            clearBit(PAD_CIRCLE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
+-            clearBit(PAD_SQUARE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
+-            clearBit(PAD_TRIANGLE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
+-            clearBit(PAD_L1);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
+-            clearBit(PAD_R1);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
+-            clearBit(PAD_L2);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
+-            clearBit(PAD_R2);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
+-            clearBit(PAD_START);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
+-            clearBit(PAD_SELECT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
+-            clearBit(PAD_L3);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB))
+-            clearBit(PAD_R3);
+-
+-        float lx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_X);
+-        float ly = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_Y);
+-        float rx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_X);
+-        float ry = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
+-        data[6] = static_cast<uint8_t>(128 + lx * 127);
+-        data[7] = static_cast<uint8_t>(128 + ly * 127);
+-        data[4] = static_cast<uint8_t>(128 + rx * 127);
+-        data[5] = static_cast<uint8_t>(128 + ry * 127);
++bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
++{
++    if (!data || size < 32 || port < 0 || port >= kMaxPorts)
++        return false;
++
++    PortSnapshot s;
++    bool polled = false;
++    {
++        std::lock_guard<std::mutex> lock(g_padMutex);
++        polled = g_polled;
++        if (polled)
++            s = g_ports[port];
+     }
+-    else
+-    {
+-        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
+-            clearBit(PAD_UP);
+-        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
+-            clearBit(PAD_DOWN);
+-        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
+-            clearBit(PAD_LEFT);
+-        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
+-            clearBit(PAD_RIGHT);
+-        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
+-            clearBit(PAD_CROSS);
+-        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
+-            clearBit(PAD_CIRCLE);
+-        if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
+-            clearBit(PAD_SQUARE);
+-        if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
+-            clearBit(PAD_TRIANGLE);
+-        if (IsKeyDown(KEY_Q))
+-            clearBit(PAD_L1);
+-        if (IsKeyDown(KEY_E))
+-            clearBit(PAD_R1);
+-        if (IsKeyDown(KEY_LEFT_SHIFT))
+-            clearBit(PAD_L2);
+-        if (IsKeyDown(KEY_RIGHT_SHIFT))
+-            clearBit(PAD_R2);
+-        if (IsKeyDown(KEY_ENTER))
+-            clearBit(PAD_START);
+-        if (IsKeyDown(KEY_TAB))
+-            clearBit(PAD_SELECT);
++    if (!polled && IsWindowReady())
++    {
++        // Platforms whose frame loop doesn't call pollHost(): read directly.
++        PortSnapshot ports[kMaxPorts];
++        pollDirect(ports);
++        s = ports[port];
+     }
+ 
+-    data[2] = static_cast<uint8_t>(btns & 0xFF);
+-    data[3] = static_cast<uint8_t>(btns >> 8);
++    std::memset(data, 0, 32);
++    data[1] = kPadAnalogMarker;
++    data[2] = static_cast<uint8_t>(s.buttons & 0xFFu);
++    data[3] = static_cast<uint8_t>(s.buttons >> 8);
++    data[4] = s.rx;
++    data[5] = s.ry;
++    data[6] = s.lx;
++    data[7] = s.ly;
++    std::memcpy(data + 8, s.pressure, sizeof(s.pressure));
+     return true;
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 4cc2e1b..275769a 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,4 +1,5 @@
+ #include "ps2_runtime.h"
++#include "runtime/ps2_pad_host.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+@@ -836,6 +837,7 @@ bool PS2Runtime::initialize(const char *title)
+         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+ #endif
+         SetTargetFPS(60);
++        ps2PadHostInit();
+         if (m_debugUiInitCallback)
+         {
+             m_debugUiInitCallback(*this, m_debugUiUserData);
+@@ -2563,6 +2565,7 @@ void PS2Runtime::run()
+             m_debugUiDrawCallback(*this, m_debugUiUserData);
+         }
+         EndDrawing();
++        ps2PadHostPoll();
+ 
+         if (WindowShouldClose())
+         {

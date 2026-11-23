@@ -136,6 +136,9 @@ keeping it constant means a new stub binding recompiles a few files instead of a
 - `0019-ee-thread-context-vf0-constant.patch`: threads created by the game started with VU0 `vf0` = 0
   instead of the hardwired (0,0,0,1), so every VU0 matrix routine that uses `vf0` (unit matrix, quaternion
   to matrix, the `w` = 1 row) produced zeros and gameplay rendered nothing.
+- `0020-controller-support.patch`: every connected controller is used (two PS2 ports, hot-plug), with
+  SDL GameControllerDB mappings loaded at start-up, a raw fallback for unmapped devices, stick deadzones,
+  analog L2/R2 pressure, and the keyboard working alongside controllers. See "Controls".
 
 ## Manual bindings
 
@@ -259,7 +262,39 @@ decoder. FMV playback (Sofdec, also IPU) is not done yet; the opening movie is s
 
 Known gaps: no audio output yet (SPU2 not emulated), IPU-decoded still images and FMVs are not emulated.
 
-## Controls (keyboard)
+## Controls
+
+### Controllers
+
+Any controller Windows sees works, and two can be used at once: the first one is PS2 controller port 1 (shared
+with the keyboard), the second is port 2. Controllers can be plugged in or unplugged while the game runs.
+
+- **Mapped controllers** (Xbox 360/One/Series, DualShock 3/4, DualSense, Switch Pro and Joy-Con grips, 8BitDo,
+  Logitech, PowerA, most generic USB pads and PS2-to-USB adapters): the layout comes from the community
+  [SDL GameControllerDB](https://github.com/mdqinc/SDL_GameControllerDB) (`gamecontrollerdb.txt`, zlib licence,
+  see `gamecontrollerdb_LICENSE.txt`). Buttons are positional, like a DualShock 2:
+
+  | PS2 | Xbox | PlayStation | Nintendo |
+  |---|---|---|---|
+  | Cross / Circle / Square / Triangle | A / B / X / Y | ✕ / ○ / □ / △ | B / A / Y / X |
+  | L1 / R1 | LB / RB | L1 / R1 | L / R |
+  | L2 / R2 (analog pressure) | LT / RT | L2 / R2 | ZL / ZR |
+  | L3 / R3 | stick clicks | L3 / R3 | stick clicks |
+  | Select / Start | View (Back) / Menu (Start) | Share/Create / Options | − / + |
+  | D-pad, sticks | D-pad, sticks | D-pad, sticks | D-pad, sticks |
+
+- **Controllers without a mapping** use the layout of PS2-to-USB adapters: buttons 1–12 = Triangle, Circle,
+  Cross, Square, L2, R2, L1, R1, Select, Start, L3, R3; the hat is the D-pad; axes 1/2 left stick, 3/4 right stick.
+  To map one properly, create a mapping line with
+  [SDL2 Gamepad Tool](https://generalarcade.com/gamepadtool/) and put it in `gamecontrollerdb_user.txt` in this
+  folder (or set `SDL_GAMECONTROLLERCONFIG`).
+
+`run_log.txt` lists each controller as it connects (`[pad] controller 1 connected: ...`), including whether it
+was mapped. Rumble isn't supported (raylib's GLFW backend has no vibration). A DualShock 3 needs its Windows
+driver (DsHidMini) first. If Steam is running with Steam Input enabled for this program, Steam's virtual Xbox
+controller is what the game sees.
+
+### Keyboard
 
 | PS2 | Key |
 |---|---|
@@ -267,8 +302,9 @@ Known gaps: no audio output yet (SPU2 not emulated), IPU-decoded still images an
 | Start / Select | Enter / Tab |
 | D-pad | Arrow keys or WASD |
 | L1 / R1 / L2 / R2 | Q / E / Left Shift / Right Shift |
+| L3 / R3 | Left Ctrl / Right Ctrl |
 
-A connected gamepad is used instead of the keyboard when present. Saves go to `game\mc0\BASLUS-20694`.
+The keyboard always works, also with controllers connected. Saves go to `game\mc0\BASLUS-20694`.
 
 ## After the first boot
 
