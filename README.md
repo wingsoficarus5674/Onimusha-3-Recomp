@@ -186,6 +186,14 @@ keeping it constant means a new stub binding recompiles a few files instead of a
   VU1 memory, GS privileged registers and the GS calls the runtime's stubs make. `PS2X_VIF1_SYNC=1` runs
   VIF1 on the game thread again (for debugging). VU1 D/T-bit debug stops aren't reported to the EE while
   this is on.
+- `0029-spu2-sound-output.patch`: sound. The IOP now has an SPU2: 2 MB of sound RAM, both cores' 24 ADPCM
+  voices (ADSR envelopes, pitch, pitch modulation, looping, ENDX, key on/off), the AutoDMA input that
+  streamed audio uses, the core mixer and the SPU2 interrupt. Reverb is not emulated. SPU DMA and
+  `sceSdVoiceTrans` now really copy data into sound RAM, and the mixed 48 kHz output is played through a
+  raylib audio stream (resampled by up to 15% to follow the emulation's speed; if the game runs slower
+  than that, the sound has gaps). The music (CRI ADX) arrives on core 0's AutoDMA input while the sound
+  driver leaves that input's mix gates and volume at zero; it is passed straight to the output in that case.
+  `PS2X_SPU2_STRICT_ADMA=1` turns that off.
 
 ## Manual bindings
 
@@ -287,6 +295,10 @@ in this runtime a guest thread that never makes a syscall would never yield.
     work is now split over several threads (game, VU1, rasteriser bands, window), and on that machine they
     share two cores. With one core each and a faster CPU, every one of them needs well under a frame's time
     (the VU1 thread, the busiest, used about 21 ms of CPU per frame on the 2.3 GHz machine).
+20. Sound (patch 0029): music and sound effects play.
+21. Still open: FMV cutscenes stay black (the opening movie never starts streaming its data, so no MPEG
+    data reaches the decoder), and SPECIAL FEATURES takes about 35 seconds of black screen to open (its data
+    loads at the speed the IOP sound driver accepts it).
 
 ## Code overlays
 
