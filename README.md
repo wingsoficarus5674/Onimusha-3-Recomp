@@ -174,6 +174,18 @@ keeping it constant means a new stub binding recompiles a few files instead of a
   registers and flags). Flags, Q, P and stores, which are read without interlocks, keep their pipelines.
   With a few smaller changes (vectorised operand normalisation, fewer pipeline scans) VU1 is about 1.8x
   faster again.
+- `0027-vu1-fast-paths.patch`: VU1 is about 1.8x faster again, still bit-identical on the captured calls:
+  the FMAC add/sub/mul/madd/msub family runs four lanes at once with SSE whenever every written lane is
+  clearly in range (where the flags are only signs; anything else takes the exact path), MAC/status/clip
+  results are applied only when something reads them (flag instructions, a DIV result, the end of the
+  program), each instruction pair's stall check and result timing use a precomputed list, NOPs and unused
+  operand conversions are skipped, and XGKICK copies whole quadwords.
+- `0028-vif1-vu1-worker-thread.patch`: VIF1 DMA, the VU1 microprograms it starts and the GS packets they
+  send run on their own thread, alongside the game, as on the real hardware. The game thread only waits where
+  it could observe that work: VIF/GIF_STAT/DMA registers (the game syncs once a frame in `sceGsSyncPath`),
+  VU1 memory, GS privileged registers and the GS calls the runtime's stubs make. `PS2X_VIF1_SYNC=1` runs
+  VIF1 on the game thread again (for debugging). VU1 D/T-bit debug stops aren't reported to the EE while
+  this is on.
 
 ## Manual bindings
 
@@ -270,11 +282,11 @@ in this runtime a guest thread that never makes a syscall would never yield.
 17. ~~Black screen in gameplay: every vertex at 0,0~~ (patches 0018, 0019; libvu0 is no longer replaced by
     the runtime's HLE versions, the game's own routines are recompiled)
 18. NEW GAME starts and the 3D gameplay renders.
-19. Speed (patches 0021-0026): menus run at full speed. 3D gameplay runs at about 3.5x the speed it had
-    before these patches (measured on a 2-core cloud machine: 5.7 -> 15-21 frames per second; a desktop CPU
-    with more and faster cores does better, and the rasteriser uses the extra cores). The IOP is now almost
-    idle; about three quarters of the game thread's time goes to the VU1 interpreter (3D geometry), which is
-    what still keeps gameplay below full speed on slower CPUs.
+19. Speed (patches 0021-0028): menus run at full speed. 3D gameplay runs at about 6x the speed it had
+    before these patches, measured on a 2-core 2.3 GHz cloud machine: 5.7 -> 31-42 frames per second. The
+    work is now split over several threads (game, VU1, rasteriser bands, window), and on that machine they
+    share two cores. With one core each and a faster CPU, every one of them needs well under a frame's time
+    (the VU1 thread, the busiest, used about 21 ms of CPU per frame on the 2.3 GHz machine).
 
 ## Code overlays
 
